@@ -3,4 +3,4 @@
 
 برای نصب :
 
-bash <(curl -Ls https://raw.githubusercontent.com/bardia-us/ExitTunnel/refs/heads/main/ExitTunnel.sh)
+```bash <(curl -Ls https://raw.githubusercontent.com/bardia-us/ExitTunnel/refs/heads/main/ExitTunnel.sh)```
