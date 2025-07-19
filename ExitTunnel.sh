@@ -1,36 +1,37 @@
-#!/bin/bash
+!/bin/bash
 
 # ==============================================================================
 # ExitTunnel Simple TCP/UDP Manager - Developed by @mr_bxs
 # ==============================================================================
-# This script sets up a basic TCP/UDP tunnel between two servers.
-# It configures one server as the 'Forwarder' (Iran side, for X-UI/Sanayi)
+# This script sets up a basic TCP/UDP tunnel between two servers using socat.
+# It configures one server as the 'Forwarder' (Iran side, for X-UI/Sanayi outbound)
 # and another as the 'Receiver' (Foreign side, connected by Iran Server).
 #
 # GitHub: [Upload to GitHub & put your link here]
 # Telegram ID: @mr_bxs
-# Script Version: 7.0 (ExitTunnel Simple TCP/UDP)
+# Script Version: 7.0 (ExitTunnel Simple TCP/UDP - Final)
 # ==============================================================================
 
 # --- Global Variables & Configuration ---
 LOG_FILE="/var/log/exittunnel_simple_tcpudp.log"
 TUNNEL_CONFIG_DIR="/etc/exittunnel" # Central directory for tunnel configs
+SCRIPT_VERSION="7.0" # Set script version here
 
 # --- Helper Functions ---
 
 # Function to get the server's public IPv4 address
 function get_public_ipv4() {
-    local ip=$(dig @resolver4.opendns.com myip.opendns.com +short -4 || \
-               curl -s4 --connect-timeout 5 "https://api.ipify.org" || \
-               curl -s4 --connect-timeout 5 "https://ipv4.icanhazip.com")
+    local ip=$(curl -s4 --connect-timeout 5 "https://api.ipify.org" || \
+               curl -s4 --connect-timeout 5 "https://ipv4.icanhazip.com" || \
+               curl -s4 --connect-timeout 5 "http://ifconfig.me/ip")
     echo "${ip:-N/A}"
 }
 
-# Function to get the server's public IPv6 address (optional for this simple tunnel)
+# Function to get the server's public IPv6 address
 function get_public_ipv6() {
-    local ip6=$(dig @resolver4.opendns.com myip.opendns.com +short -6 || \
-                curl -s6 --connect-timeout 5 "https://api6.ipify.org" || \
-                curl -s6 --connect-timeout 5 "https://ipv6.icanhazip.com")
+    local ip6=$(curl -s6 --connect-timeout 5 "https://api6.ipify.org" || \
+                curl -s6 --connect-timeout 5 "https://ipv6.icanhazip.com" || \
+                curl -s6 --connect-timeout 5 "http://ifconfig.me/ip")
     echo "${ip6:-N/A}"
 }
 
@@ -53,15 +54,15 @@ function display_header() {
     echo "Telegram Channel => @mr_bxs"
     echo "Tunnel script based on Simple TCP/UDP Forwarding"
     echo "========================================"
-    echo "     🌐 Server Information"
+    echo " 🌐 Server Information"
     echo "========================================"
-    echo "  IPv4 Address: $(get_public_ipv4)"
-    echo "  IPv6 Address: $(get_public_ipv6)"
-    echo "  Script Version: $SCRIPT_VERSION"
+    echo " IPv4 Address: $(get_public_ipv4)"
+    echo " IPv6 Address: $(get_public_ipv6)"
+    echo " Script Version: $SCRIPT_VERSION"
     echo "========================================\n"
 }
 
-# --- Tunnel Configuration Functions ---
+# --- Core Functions ---
 
 # Installs socat for TCP/UDP forwarding
 function install_socat() {
@@ -140,7 +141,7 @@ function create_iran_forwarder_tunnel() {
 
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=ExitTunnel Forwarder TCP/UDP on Port ${TUNNEL_PORT}
+Description=ExitTunnel Forwarder ${PROTOCOL^^} on Port ${TUNNEL_PORT}
 After=network.target
 
 [Service]
@@ -163,21 +164,20 @@ EOF
         log_action "✅ ExitTunnel Forwarder (${PROTOCOL}) started on port ${TUNNEL_PORT} (Iran Server)."
         echo "\n🎉 ExitTunnel Forwarder on your Iran Server is ready!"
         echo "--------------------------------------------------------------------------------"
-        echo "  X-UI/Sanayi Configuration Details:"
-        echo "  - Protocol: VLESS/VMess (or desired protocol)"
-        echo "  - Server IP: Your Iran Server's Public IP"
-        echo "  - Server Port: Any port for X-UI Inbound (e.g., 443, 8080)"
-        echo "  - External Proxy: Yes (or Outbound/Route settings)"
-        echo "  - External Proxy IP: 127.0.0.1 (localhost)"
-        echo "  - External Proxy Port: ${TUNNEL_PORT} (This is the port socat is listening on)"
-        echo "  - External Proxy Protocol: ${PROTOCOL} (Must match socat's protocol)"
+        echo " X-UI/Sanayi Configuration Details:"
+        echo " - Use your Iran Server's Public IP for your X-UI/Sanayi Inbound."
+        echo " - In X-UI/Sanayi Outbound settings for this tunnel:"
+        echo " - Protocol: TCP (or whatever your X-UI Outbound supports that routes locally)"
+        echo " - Server IP: 127.0.0.1 (localhost)"
+        echo " - Server Port: ${TUNNEL_PORT} (This is the port socat is listening on for X-UI)"
+        echo " - This assumes X-UI can route traffic directly to a local TCP/UDP port."
         echo "--------------------------------------------------------------------------------"
-        echo "IMPORTANT: Open port ${TUNNEL_PORT} (${PROTOCOL}) and your X-UI Inbound ports (e.g., 443, 8080) in your Iran Server's firewall!"
+        echo "IMPORTANT: Open port ${TUNNEL_PORT} (${PROTOCOL^^}) and your X-UI Inbound ports (e.g., 443, 8080) in your Iran Server's firewall!"
         echo "Restart X-UI/Sanayi after making changes."
     else
         log_action "❌ Failed to start ExitTunnel Forwarder. Check logs with 'journalctl -u ${SERVICE_NAME} -f'."
         echo "❌ ExitTunnel Forwarder failed to start."
-        echo "   Check logs with 'journalctl -u ${SERVICE_NAME} -f'."
+        echo " Check logs with 'journalctl -u ${SERVICE_NAME} -f'."
     fi
     press_enter_to_continue
 }
@@ -185,7 +185,7 @@ EOF
 # Creates a new tunnel configuration (Foreign Server - Receiver)
 function create_foreign_receiver_tunnel() {
     echo "\n=== Configure Foreign Server (Receiver) ==="
-    echo "This server will act as the tunnel endpoint, receiving traffic and sending it to the internet."
+    echo "This server will act as the tunnel endpoint, receiving traffic from Iran and sending it to the internet."
     echo "Type 'back' at any prompt to return to the main menu."
 
     if ! command -v socat &> /dev/null; then
@@ -224,13 +224,13 @@ function create_foreign_receiver_tunnel() {
 
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=ExitTunnel Receiver TCP/UDP on Port ${TUNNEL_PORT}
+Description=ExitTunnel Receiver ${PROTOCOL^^} on Port ${TUNNEL_PORT}
 After=network.target
 
 [Service]
 Type=simple
 User=root
-ExecStart=/usr/bin/socat ${PROTOCOL}-LISTEN:${TUNNEL_PORT},fork SOCKS4:127.0.0.1:9050,socksclient,retry=3,timeout=10 # Assuming Tor's SOCKS port (9050) for internet access
+ExecStart=/usr/bin/socat ${PROTOCOL}-LISTEN:${TUNNEL_PORT},fork SOCKS4:127.0.0.1:9050,socksclient,retry=3,timeout=10
 Restart=on-failure
 RestartSec=5s
 
@@ -247,18 +247,18 @@ EOF
         log_action "✅ ExitTunnel Receiver (${PROTOCOL}) started on port ${TUNNEL_PORT} (Foreign Server)."
         echo "\n🎉 ExitTunnel Receiver on your Foreign Server is ready!"
         echo "--------------------------------------------------------------------------------"
-        echo "  Foreign Server Details for Iran Server to connect to:"
-        echo "  Server IP      : $(get_public_ipv4)"
-        echo "  Tunnel Port    : ${TUNNEL_PORT}"
-        echo "  Protocol       : ${PROTOCOL}"
+        echo " Foreign Server Details for Iran Server to connect to:"
+        echo " Server IP : $(get_public_ipv4)"
+        echo " Tunnel Port : ${TUNNEL_PORT}"
+        echo " Protocol : ${PROTOCOL}"
         echo "--------------------------------------------------------------------------------"
-        echo "IMPORTANT: Open port ${TUNNEL_PORT} (${PROTOCOL}) in your Foreign Server's firewall!"
-        echo "  Also, ensure a local SOCKS proxy (e.g., Tor, Shadowsocks) is running on 127.0.0.1:9050 on this server."
-        echo "  Otherwise, you might not have internet access through the tunnel."
+        echo "IMPORTANT: Open port ${TUNNEL_PORT} (${PROTOCOL^^}) in your Foreign Server's firewall!"
+        echo " Also, ensure a local SOCKS proxy (e.g., Tor, Shadowsocks) is running on 127.0.0.1:9050 on this server."
+        echo " Otherwise, you might not have internet access through the tunnel."
     else
         log_action "❌ Failed to start ExitTunnel Receiver. Check logs with 'journalctl -u ${SERVICE_NAME} -f'."
         echo "❌ ExitTunnel Receiver failed to start."
-        echo "   Check logs with 'journalctl -u ${SERVICE_NAME} -f'."
+        echo " Check logs with 'journalctl -u ${SERVICE_NAME} -f'."
     fi
     press_enter_to_continue
 }
@@ -290,22 +290,22 @@ function list_and_delete_tunnels() {
                 local foreign_ip=$(echo "$config_data" | awk -F':' '{print $1}')
                 local tunnel_port=$(echo "$config_data" | awk -F':' '{print $2}')
                 local protocol=$(echo "$config_data" | awk -F':' '{print $3}')
-                details="    - Forwarding to: ${foreign_ip}:${tunnel_port} (${protocol})"
+                details=" - Forwarding to: ${foreign_ip}:${tunnel_port} (${protocol^^})"
             elif [[ "$filename" == exittunnel-receiver-*.conf ]]; then
                 role_display="Foreign Server (Receiver)"
                 local config_data=$(cat "$config_file" 2>/dev/null)
                 local tunnel_port=$(echo "$config_data" | awk -F':' '{print $1}')
                 local protocol=$(echo "$config_data" | awk -F':' '{print $2}')
-                details="    - Listening on: ${tunnel_port} (${protocol})"
+                details=" - Listening on: ${tunnel_port} (${protocol^^})"
             fi
 
             config_files_map["$i"]="$config_file"
             service_names_map["$i"]="$service_name"
             
             echo -e "\n[$i] Role: ${role_display} | Service: ${service_name}"
-            echo "    Path: ${config_file}"
+            echo " Path: ${config_file}"
             echo "${details}"
-            echo "    Status: $(systemctl is-active "$service_name" 2>/dev/null || echo "inactive")"
+            echo " Status: $(systemctl is-active "$service_name" 2>/dev/null || echo "inactive")"
             i=$((i+1))
         fi
     done
@@ -328,7 +328,7 @@ function list_and_delete_tunnels() {
                 log_action "🗑 Stopping and disabling service: ${service_to_delete}..."
                 systemctl stop "$service_to_delete" > /dev/null 2>&1
                 systemctl disable "$service_to_delete" > /dev/null 2>&1
-                log_action "🗑 Deleting service file and config: ${service_to_delete}.service and ${file_to_delete}..."
+                log_action "🗑 Deleting service file and config: /etc/systemd/system/${service_to_delete}.service and ${file_to_delete}..."
                 rm -f "/etc/systemd/system/${service_to_delete}.service"
                 rm -f "$file_to_delete"
                 systemctl daemon-reload > /dev/null 2>&1
@@ -379,7 +379,7 @@ function main_menu() {
         echo "1) Create New Tunnel"
         echo "2) List & Delete Tunnels"
         echo "3) Check Tunnel Status & Logs"
-        echo "4) Uninstall Socat and Tunnel Configs" # Change to uninstall socat + tunnel
+        echo "4) Uninstall All Tunnels & Socat (if installed by script)"
         echo "5) Exit"
         read -p "👉 Your choice: " CHOICE
 
@@ -394,10 +394,8 @@ function main_menu() {
                 check_tunnel_status
                 ;;
             4)
-                # This should uninstall socat and all configs.
-                # For simplicity, we just delete configs for now.
-                # Actual socat uninstall depends on package manager.
-                read -p "Are you sure you want to remove ALL tunnel configs and stop services? (y/N): " CONFIRM_CLEAN
+                # Uninstall all services created by script and remove socat
+                read -p "Are you sure you want to remove ALL tunnel configs, stop services, and uninstall socat? (y/N): " CONFIRM_CLEAN
                 if [[ "$CONFIRM_CLEAN" =~ ^[yY]$ ]]; then
                     log_action "🗑 Stopping and deleting all ExitTunnel services and configs..."
                     for service_file in /etc/systemd/system/exittunnel-*.service; do
@@ -412,7 +410,23 @@ function main_menu() {
                     rm -rf "$TUNNEL_CONFIG_DIR"
                     systemctl daemon-reload > /dev/null 2>&1
                     log_action "✅ All ExitTunnel configs removed and services stopped."
-                    echo "All ExitTunnel configurations removed and services stopped. You may manually uninstall 'socat'."
+
+                    log_action "🗑 Attempting to uninstall 'socat'..."
+                    if command -v apt-get &> /dev/null; then
+                        sudo apt-get remove socat -y > /dev/null 2>&1
+                        sudo apt-get autoremove -y > /dev/null 2>&1
+                    elif command -v yum &> /dev/null; then
+                        sudo yum remove socat -y > /dev/null 2>&1
+                        sudo yum autoremove -y > /dev/null 2>&1
+                    elif command -v dnf &> /dev/null; then
+                        sudo dnf remove socat -y > /dev/null 2>&1
+                        sudo dnf autoremove -y > /dev/null 2>&1
+                    else
+                        log_action "⚠️ Warning: Could not detect package manager to uninstall 'socat'. Please uninstall it manually."
+                        echo "Warning: Could not detect package manager to uninstall 'socat'. Please uninstall it manually."
+                    fi
+                    log_action "✅ 'socat' uninstallation attempted."
+                    echo "All ExitTunnel configurations and services stopped. 'socat' uninstallation attempted."
                 else
                     echo "Cleanup cancelled."
                 fi
@@ -461,3 +475,4 @@ function create_tunnel_menu() {
 
 # --- Start the script ---
 main_menu
+
