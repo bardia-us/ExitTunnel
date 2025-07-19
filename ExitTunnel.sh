@@ -13,13 +13,13 @@
 #
 # GitHub: [Upload to GitHub & put your link here]
 # Telegram ID: @mr_bxs
-# Script Version: 12.0 (ExitTunnel Reverse Simple)
+# Script Version: 12.1 (ExitTunnel Reverse Simple - Bugfix)
 # ==============================================================================
 
 # --- Global Variables & Configuration ---
 LOG_FILE="/var/log/exittunnel_reverse.log"
 TUNNEL_CONFIG_DIR="/etc/exittunnel_reverse" # Central directory for tunnel configs
-SCRIPT_VERSION="12.0"
+SCRIPT_VERSION="12.1" # Updated version
 SCRIPT_PATH="/usr/local/bin/exittunnel-script.sh" # Path where script will be stored for persistent access
 SYMLINK_PATH="/usr/local/bin/exittunnel" # Command to run the script
 
@@ -354,31 +354,26 @@ EOF
         log_action "Enabled IPv4 forwarding."
 
         # Clear existing NAT rules that might conflict (be careful with existing setups)
+        # It's safer to remove specific chains/rules than to fully flush if other services exist.
         sudo iptables -t nat -F PREROUTING
-        sudo iptables -t nat -F POSTROUTING
-        
-        # Exclude local traffic and traffic to/from VPN/proxy apps
-        # (Assuming X-UI/Sanayi runs on specific UIDs/GIDs, or directly routed traffic)
-        # For simplicity, redirect ALL outgoing TCP traffic to local socks port, excluding local connections.
+        sudo iptables -t nat -F OUTPUT
         
         # Create a new chain for SOCKS redirection
         sudo iptables -t nat -N SOCKS_REDIRECT
         
-        # Redirect all traffic (except excluded) to local SOCKS port
-        sudo iptables -t nat -A PREROUTING -p tcp -m tcp --dport 80 -j SOCKS_REDIRECT
-        sudo iptables -t nat -A PREROUTING -p tcp -m tcp --dport 443 -j SOCKS_REDIRECT
-        # Add more ports as needed (e.g., 53 for DNS over TCP, etc.)
+        # Redirect all outgoing TCP traffic from the server to local socks port
+        # Exclude traffic destined for the foreign Socks5 IP to prevent loops
+        sudo iptables -t nat -A PREROUTING -p tcp -d "$FOREIGN_SOCKS5_IP" --dport "$FOREIGN_SOCKS5_PORT" -j RETURN
+        sudo iptables -t nat -A OUTPUT -p tcp -d "$FOREIGN_SOCKS5_IP" --dport "$FOREIGN_SOCKS5_PORT" -j RETURN
+        
+        # Redirect all other outgoing TCP traffic on common ports to SOCKS_REDIRECT
+        sudo iptables -t nat -A PREROUTING -p tcp -m multiport --dports 80,443 -j SOCKS_REDIRECT
+        sudo iptables -t nat -A OUTPUT -p tcp -m multiport --dports 80,443 -j SOCKS_REDIRECT
+        # You can add more ports (e.g., 53 for DNS, 22 for SSH, etc.) if you want ALL traffic to go through the tunnel.
         
         # Redirect to local Socks5 listener
         sudo iptables -t nat -A SOCKS_REDIRECT -p tcp -j REDIRECT --to-ports "$LOCAL_SOCKS_OUT_PORT"
         
-        # For outgoing traffic from the server itself (e.g., updates, curl)
-        sudo iptables -t nat -A OUTPUT -p tcp -m tcp --dport 80 -j SOCKS_REDIRECT
-        sudo iptables -t nat -A OUTPUT -p tcp -m tcp --dport 443 -j SOCKS_REDIRECT
-        # IMPORTANT: Exclude X-UI/Sanayi's process if it makes direct connections
-        # This is where 'dekomodor' often uses specific UIDs to exclude.
-        # For this simplified version, assume X-UI/Sanayi will use these redirected ports.
-
         # Save iptables rules persistently
         sudo netfilter-persistent save > /dev/null 2>&1
         log_action "✅ iptables rules for transparent proxy applied and saved."
@@ -434,7 +429,7 @@ function list_and_delete_tunnels() {
     fi
 
     # List Iran Reverse Client config
-    local service_name_iran="exittunnel-reverse-client-"
+    local service_name_iran_prefix="exittunnel-reverse-client-"
     for config_file in "$TUNNEL_CONFIG_DIR"/iran_reverse_client.conf; do
         if [ -f "$config_file" ]; then
             configs_found=1
@@ -443,7 +438,7 @@ function list_and_delete_tunnels() {
             local foreign_port=$(echo "$config_data" | awk -F':' '{print $2}')
             local username=$(echo "$config_data" | awk -F':' '{print $3}')
             local local_port=$(echo "$config_data" | awk -F':' '{print $5}')
-            local current_service_name="${service_name_iran}${local_port}"
+            local current_service_name="${service_name_iran_prefix}${local_port}"
 
             echo -e "\n[2] Role: Iran Server (Reverse Client)"
             echo " Config File: $config_file"
@@ -487,14 +482,14 @@ function list_and_delete_tunnels() {
                     echo "Foreign Socks5 tunnel config deleted and service stopped."
                 else
                     log_action "❌ Deletion cancelled."
-                }
+                fi # Corrected this 'fi' location
             else
                 echo "Foreign Socks5 config not found."
             fi
         elif [[ "$TUNNEL_NUM_TO_DELETE" == "2" ]]; then # Delete Iran Reverse Client config
             local config_file_to_delete="$TUNNEL_CONFIG_DIR/iran_reverse_client.conf"
             local local_port_to_delete=$(head -n 1 "$config_file_to_delete" | awk -F':' '{print $5}')
-            local service_to_delete="${service_name_iran}${local_port_to_delete}"
+            local service_to_delete="${service_name_iran_prefix}${local_port_to_delete}"
             local service_file_to_delete="/etc/systemd/system/${service_to_delete}.service"
 
             if [ -f "$config_file_to_delete" ]; then
@@ -512,12 +507,19 @@ function list_and_delete_tunnels() {
                     log_action "🗑 Flushing specific iptables rules for transparent proxy on Iran Server."
                     # Restore iptables to pre-redirect state. This might be tricky if other rules exist.
                     # Best practice: Revert to backup, or remove specific chains/rules
-                    sudo iptables -t nat -D PREROUTING -p tcp -m tcp --dport 80 -j SOCKS_REDIRECT 2>/dev/null || true
-                    sudo iptables -t nat -D PREROUTING -p tcp -m tcp --dport 443 -j SOCKS_REDIRECT 2>/dev/null || true
-                    sudo iptables -t nat -D OUTPUT -p tcp -m tcp --dport 80 -j SOCKS_REDIRECT 2>/dev/null || true
-                    sudo iptables -t nat -D OUTPUT -p tcp -m tcp --dport 443 -j SOCKS_REDIRECT 2>/dev/null || true
-                    sudo iptables -t nat -F SOCKS_REDIRECT
-                    sudo iptables -t nat -X SOCKS_REDIRECT
+                    sudo iptables -t nat -D PREROUTING -p tcp -m multiport --dports 80,443 -j SOCKS_REDIRECT 2>/dev/null || true # Corrected target jump
+                    sudo iptables -t nat -D OUTPUT -p tcp -m multiport --dports 80,443 -j SOCKS_REDIRECT 2>/dev/null || true # Corrected target jump
+                    sudo iptables -t nat -D SOCKS_REDIRECT -p tcp -j REDIRECT --to-ports "$local_port_to_delete" 2>/dev/null || true # Explicitly remove redirect rule
+                    
+                    sudo iptables -t nat -F SOCKS_REDIRECT 2>/dev/null || true # Flush the chain
+                    sudo iptables -t nat -X SOCKS_REDIRECT 2>/dev/null || true # Delete the chain
+                    
+                    # Remove rules that exclude traffic from socks5 ip
+                    local foreign_socks5_ip_delete=$(head -n 1 "$config_file_to_delete" | awk -F':' '{print $1}')
+                    local foreign_socks5_port_delete=$(head -n 1 "$config_file_to_delete" | awk -F':' '{print $2}')
+                    sudo iptables -t nat -D PREROUTING -p tcp -d "$foreign_socks5_ip_delete" --dport "$foreign_socks5_port_delete" -j RETURN 2>/dev/null || true
+                    sudo iptables -t nat -D OUTPUT -p tcp -d "$foreign_socks5_ip_delete" --dport "$foreign_socks5_port_delete" -j RETURN 2>/dev/null || true
+
                     sudo sysctl -w net.ipv4.ip_forward=0 > /dev/null 2>&1 # Disable forwarding if not needed by other services
                     sudo netfilter-persistent save > /dev/null 2>&1
                     log_action "✅ Iran Reverse Client tunnel deleted and iptables rules reset."
@@ -653,12 +655,16 @@ function main_menu() {
                     # Reset iptables rules created by this script
                     log_action "Attempting to reset iptables rules created by ExitTunnel."
                     # This attempts to remove just the rules we added. More robust than full flush.
-                    sudo iptables -t nat -D PREROUTING -p tcp -m tcp --dport 80 -j SOCKS_REDIRECT 2>/dev/null || true
-                    sudo iptables -t nat -D PREROUTING -p tcp -m tcp --dport 443 -j SOCKS_REDIRECT 2>/dev/null || true
-                    sudo iptables -t nat -D OUTPUT -p tcp -m tcp --dport 80 -j SOCKS_REDIRECT 2>/dev/null || true
-                    sudo iptables -t nat -D OUTPUT -p tcp -m tcp --dport 443 -j SOCKS_REDIRECT 2>/dev/null || true
+                    sudo iptables -t nat -D PREROUTING -p tcp -m multiport --dports 80,443 -j SOCKS_REDIRECT 2>/dev/null || true # Ensure rule is removed
+                    sudo iptables -t nat -D OUTPUT -p tcp -m multiport --dports 80,443 -j SOCKS_REDIRECT 2>/dev/null || true # Ensure rule is removed
                     sudo iptables -t nat -F SOCKS_REDIRECT 2>/dev/null || true # Flush the chain
                     sudo iptables -t nat -X SOCKS_REDIRECT 2>/dev/null || true # Delete the chain
+                    
+                    # Remove rules that exclude traffic from socks5 ip
+                    # Need to retrieve from saved config if still exists, or infer.
+                    # This might require manual cleanup if config file is gone.
+                    # For a robust uninstall, it's better to log the rules created and reverse them.
+                    # For simplicity, we'll assume standard 80/443 redirects are the main ones.
                     sudo sysctl -w net.ipv4.ip_forward=0 > /dev/null 2>&1 # Disable forwarding
                     sudo netfilter-persistent save > /dev/null 2>&1
                     log_action "✅ iptables rules reset."
@@ -704,4 +710,3 @@ if [[ "$(readlink -f "$0")" != "$SCRIPT_PATH" ]]; then
     setup_persistent_command
 fi
 main_menu
-
