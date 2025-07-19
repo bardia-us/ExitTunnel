@@ -1,4 +1,4 @@
-!/bin/bash
+#!/bin/bash
 
 # ==============================================================================
 # ExitTunnel Simple TCP/UDP Manager - Developed by @mr_bxs
@@ -7,15 +7,19 @@
 # It configures one server as the 'Forwarder' (Iran side, for X-UI/Sanayi outbound)
 # and another as the 'Receiver' (Foreign side, connected by Iran Server).
 #
+# Features: Persistent services, simple 'exittunnel' command.
+#
 # GitHub: [Upload to GitHub & put your link here]
 # Telegram ID: @mr_bxs
-# Script Version: 7.0 (ExitTunnel Simple TCP/UDP - Final)
+# Script Version: 8.0 (ExitTunnel Stable & Simple)
 # ==============================================================================
 
 # --- Global Variables & Configuration ---
 LOG_FILE="/var/log/exittunnel_simple_tcpudp.log"
 TUNNEL_CONFIG_DIR="/etc/exittunnel" # Central directory for tunnel configs
-SCRIPT_VERSION="7.0" # Set script version here
+SCRIPT_VERSION="8.0" # Set script version here
+SCRIPT_PATH="/usr/local/bin/exittunnel-script.sh" # Path where script will be stored for persistent access
+SYMLINK_PATH="/usr/local/bin/exittunnel" # Command to run the script
 
 # --- Helper Functions ---
 
@@ -170,7 +174,7 @@ EOF
         echo " - Protocol: TCP (or whatever your X-UI Outbound supports that routes locally)"
         echo " - Server IP: 127.0.0.1 (localhost)"
         echo " - Server Port: ${TUNNEL_PORT} (This is the port socat is listening on for X-UI)"
-        echo " - This assumes X-UI can route traffic directly to a local TCP/UDP port."
+        echo " - External Proxy Protocol: ${PROTOCOL^^} (Must match socat's protocol)"
         echo "--------------------------------------------------------------------------------"
         echo "IMPORTANT: Open port ${TUNNEL_PORT} (${PROTOCOL^^}) and your X-UI Inbound ports (e.g., 443, 8080) in your Iran Server's firewall!"
         echo "Restart X-UI/Sanayi after making changes."
@@ -250,7 +254,7 @@ EOF
         echo " Foreign Server Details for Iran Server to connect to:"
         echo " Server IP : $(get_public_ipv4)"
         echo " Tunnel Port : ${TUNNEL_PORT}"
-        echo " Protocol : ${PROTOCOL}"
+        echo " Protocol : ${PROTOCOL^^}"
         echo "--------------------------------------------------------------------------------"
         echo "IMPORTANT: Open port ${TUNNEL_PORT} (${PROTOCOL^^}) in your Foreign Server's firewall!"
         echo " Also, ensure a local SOCKS proxy (e.g., Tor, Shadowsocks) is running on 127.0.0.1:9050 on this server."
@@ -276,7 +280,9 @@ function list_and_delete_tunnels() {
     mkdir -p "$TUNNEL_CONFIG_DIR" # Ensure config directory exists
     
     # List all tunnel config files
-    for config_file in "$TUNNEL_CONFIG_DIR"/*.conf; do
+    local all_config_files=("$TUNNEL_CONFIG_DIR"/*.conf) 
+
+    for config_file in "${all_config_files[@]}"; do
         if [ -f "$config_file" ]; then
             configs_found=1
             local filename=$(basename "$config_file")
@@ -473,6 +479,22 @@ function create_tunnel_menu() {
     done
 }
 
+# --- Initial Setup for Persistent Command ---
+function setup_persistent_command() {
+    if [ ! -f "$SYMLINK_PATH" ] || [ "$(readlink "$SYMLINK_PATH")" != "$SCRIPT_PATH" ]; then
+        log_action "Configuring persistent 'exittunnel' command."
+        sudo cp "$0" "$SCRIPT_PATH" # Copy the current running script to a persistent location
+        sudo chmod +x "$SCRIPT_PATH"
+        sudo ln -sf "$SCRIPT_PATH" "$SYMLINK_PATH" # Create a symlink to make it accessible system-wide
+        echo "✅ 'exittunnel' command is now set up. You can run the script by typing 'exittunnel' from anywhere."
+        press_enter_to_continue
+    fi
+}
+
 # --- Start the script ---
+# Check if the script is being run for the first time or if the persistent command needs setup
+if [ "$(basename "$0")" == "exittunnel.sh" ] || [ "$(basename "$0")" == "ExitTunnel.sh" ]; then
+    setup_persistent_command
+fi
 main_menu
 
