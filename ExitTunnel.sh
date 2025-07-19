@@ -12,18 +12,18 @@
 #
 # GitHub: [Upload to GitHub & put your link here]
 # Telegram ID: @mr_bxs
-# Script Version: 12.0 (Final - VXLAN with Auto-Dekomodor)
+# Script Version: 12.1 (Final - VXLAN with Auto-Dekomodor - Bugfix)
 # ==============================================================================
 
 # --- Global Variables & Configuration ---
 LOG_FILE="/var/log/exittunnel.log"
 CONFIG_BASE_DIR="/etc/exittunnel" # Base directory for all ExitTunnel configs
-# VXLAN parameters (fixed for simplicity, can be made user-configurable if needed)
+# VXLAN parameters (fixed for simplicity, can be configured by user if needed, but for simplicity, they are fixed for now)
 VNI=88 # VXLAN Network Identifier - A unique ID for your VXLAN tunnel
 VXLAN_IF="vxlan${VNI}" # Name of the VXLAN interface
 IRAN_VXLAN_IP="30.0.0.1/24" # Internal IP for Iran side
 KHAREJ_VXLAN_IP="30.0.0.2/24" # Internal IP for Foreign side
-SCRIPT_VERSION="12.0"
+SCRIPT_VERSION="12.1" # UPDATED VERSION
 PERSISTENT_SCRIPT_PATH="/usr/local/bin/exittunnel-core.sh" # Path where script will be stored
 SYMLINK_PATH="/usr/local/bin/exittunnel" # Command to run the script
 
@@ -106,15 +106,27 @@ function install_dependencies() {
         return 1
     fi
 
-    # Verify essential commands are available
-    if ! command -v ip >/dev/null 2>&1; then echo -e "${RED}Error: 'iproute2' not installed. Aborting.${NC}"; log_action "❌ iproute2 not found after install."; press_enter_to_continue; return 1; fi
-    if ! command -v jq >/dev/null 2>&1; then echo -e "${RED}Error: 'jq' not installed. Aborting.${NC}"; log_action "❌ jq not found after install."; press_enter_to_continue; return 1; fi
-    if ! command -v haproxy >/dev/null 2>&1; then echo -e "${RED}Error: 'haproxy' not installed. Aborting.${NC}"; log_action "❌ haproxy not found after install."; press_enter_to_continue; return 1; fi
+    # Verify essential commands are available AFTER installation
+    local all_installed=true
+    for cmd in ip jq haproxy curl; do # Added curl to essential checks
+        if ! command -v "$cmd" &> /dev/null; then
+            echo -e "${RED}Error: '$cmd' not installed or not found in PATH. Aborting.${NC}"
+            log_action "❌ Essential command '$cmd' not found after installation."
+            all_installed=false
+        fi
+    done
+    
+    if [ "$all_installed" = false ]; then
+        echo -e "${RED}One or more essential dependencies failed to install or are not accessible. Please check logs and try manual installation.${NC}"
+        press_enter_to_continue
+        return 1
+    fi
     
     echo -e "${GREEN}All essential dependencies installed successfully.${NC}"
     log_action "✅ All essential dependencies installed."
     return 0
 }
+
 
 # --- Uninstall Functions ---
 function uninstall_all_exittunnel_components() {
@@ -373,9 +385,6 @@ function install_new_tunnel() {
         REMOTE_IP=$KHAREJ_IP
         log_action "Configuring Iran Server (Forwarder)."
 
-        # This will internally call configure_haproxy_port_forwarding
-        echo -e "${MAGENTA}After VXLAN setup, you will be prompted to configure HAProxy for public port forwarding.${NC}"
-
     elif [[ "$role_choice" == "2" ]]; then # Kharej Server
         read -p "Enter Iran Server Public IP (IRAN IP): " IRAN_IP
         if [ -z "$IRAN_IP" ]; then echo -e "${RED}IP cannot be empty.${NC}"; press_enter_to_continue; return; fi
@@ -412,7 +421,7 @@ function install_new_tunnel() {
     echo -e "${YELLOW}Creating VXLAN interface ${VXLAN_IF}...${NC}"
     log_action "Creating VXLAN interface."
     # Ensure the interface is not already present before adding
-    sudo ip link del "$VXLAN_IF" 2>/dev/null
+    sudo ip link del "$VXLAN_IF" 2>/dev/null || true
     sudo ip link add "$VXLAN_IF" type vxlan id "$VNI" local "$(hostname -I | awk '{print $1}' | head -n1)" remote "$REMOTE_IP" dev "$INTERFACE" dstport "$DSTPORT" nolearning
     
     echo -e "${YELLOW}Assigning IP ${MY_VXLAN_IP} to ${VXLAN_IF}...${NC}"
@@ -472,12 +481,12 @@ ip link add "$VXLAN_IF" type vxlan id "$VNI" local \$(hostname -I | awk '{print 
 ip addr add "$MY_VXLAN_IP" dev "$VXLAN_IF"
 ip link set "$VXLAN_IF" up
 
-# Re-add iptables rules on boot (ensuring persistence)
+# Re-add iptables rules on boot (in case iptables-persistent is not fully relied upon)
 sudo iptables -A INPUT -p udp --dport "$DSTPORT" -j ACCEPT
 sudo iptables -A INPUT -s "$REMOTE_IP" -j ACCEPT
 if [[ "$role_choice" == "1" ]]; then # If Iran server
     sudo iptables -A INPUT -s ${KHAREJ_VXLAN_IP%/*} -j ACCEPT
-elif [[ "$role_choice" == "2" ]]; then # If Kharej server
+elif [[ "$role_choice" == "2" ]; then # If Kharej server
     sudo iptables -A INPUT -s ${IRAN_VXLAN_IP%/*} -j ACCEPT
     sudo iptables -t nat -A POSTROUTING -o "$INTERFACE" -j MASQUERADE
 fi
@@ -698,12 +707,12 @@ function setup_persistent_command() {
     # Ensure the script is copied and symlinked properly.
     # The check readlink -f "$0" ensures we get the absolute path of the currently executing script
     # regardless of how it was called (e.g., ./ExitTunnel.sh or symlink).
-    if [ ! -f "$PERSISTENT_SCRIPT_PATH" ] || [ "$(readlink -f "$0")" != "$PERSISTENT_SCRIPT_PATH" ]; then
+    if [ ! -f "$PERSISTENT_SCRIPT_PATH" ] || [ "$(readlink -f "$0" 2>/dev/null)" != "$PERSISTENT_SCRIPT_PATH" ]; then # Added 2>/dev/null for readlink
         echo -e "${YELLOW}Setting up persistent 'exittunnel' command...${NC}"
         log_action "Configuring persistent 'exittunnel' command."
         sudo cp "$0" "$PERSISTENT_SCRIPT_PATH" # Copy the current running script to a persistent location
         sudo chmod +x "$PERSISTENT_SCRIPT_PATH"
-        sudo ln -sf "$PERSISTENT_SCRIPT_PATH" "$SYMLINK_PATH" # Create a symlink
+        sudo ln -sf "$PERSISTENT_SCRIPT_PATH" "$SYMLINK_PATH" # Create a symlink to make it accessible system-wide
         echo -e "${GREEN}✅ 'exittunnel' command is now set up. You can run the script by typing 'exittunnel' from anywhere.${NC}"
         press_enter_to_continue
         log_action "Persistent command setup complete."
@@ -712,8 +721,9 @@ function setup_persistent_command() {
 
 # --- Start the script ---
 # This block handles the very first execution and subsequent runs via 'exittunnel' command
+# Check if the script is run via its persistent symlink or directly.
+# If direct, set up persistent command.
 if [[ "$(readlink -f "$0")" != "$PERSISTENT_SCRIPT_PATH" ]]; then
     setup_persistent_command
 fi
 main_script_loop # Start the main menu loop
-
