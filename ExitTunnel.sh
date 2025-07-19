@@ -1,39 +1,29 @@
 #!/bin/bash
 
 # ==============================================================================
-# ExitTunnel Manager - Developed by @mr_bxs
+# ExitTunnel Simple Reverse Tunnel Manager - Developed by @mr_bxs
 # ==============================================================================
-# This script sets up a secure and persistent VXLAN tunnel between two servers.
-# It includes automatic "dekomodor" (traffic redirection) on the Iran server
-# and sets up the Foreign server as the internet gateway with Sanayi/X-UI.
+# This script sets up a simple reverse tunnel.
+# Iran Server acts as the main proxy for users (X-UI/Sanayi installed here).
+# Foreign Server acts as a simple receiver, forwarding traffic to the Internet.
+# The goal is to keep Iran's IP as the exit IP.
 #
-# Features: VXLAN tunnel, automatic port redirection (dekomodor), persistent services,
-# simple 'exittunnel' command, BBR, Cronjob for restarts.
+# Features: Simple TCP/UDP forwarding with socat, iptables redirection,
+# persistent services, 'exittunnel' command.
 #
 # GitHub: [Upload to GitHub & put your link here]
 # Telegram ID: @mr_bxs
-# Script Version: 11.0 (ExitTunnel VXLAN with Auto-Dekomodor)
+# Script Version: 12.0 (ExitTunnel Reverse Simple)
 # ==============================================================================
 
 # --- Global Variables & Configuration ---
-LOG_FILE="/var/log/exittunnel_vxlan.log"
-VXLAN_CONFIG_DIR="/etc/exittunnel_vxlan" # Central directory for VXLAN configs
-# VXLAN parameters (Can be configured by user if needed, but for simplicity, they are fixed for now)
-VNI=88 # VXLAN Network Identifier - A unique ID for your VXLAN tunnel
-VXLAN_IF="vxlan${VNI}" # Name of the VXLAN interface
-IRAN_VXLAN_IP="30.0.0.1/24" # Internal IP for Iran side
-KHAREJ_VXLAN_IP="30.0.0.2/24" # Internal IP for Foreign side
-SCRIPT_VERSION="11.0"
+LOG_FILE="/var/log/exittunnel_reverse.log"
+TUNNEL_CONFIG_DIR="/etc/exittunnel_reverse" # Central directory for tunnel configs
+SCRIPT_VERSION="12.0"
 SCRIPT_PATH="/usr/local/bin/exittunnel-script.sh" # Path where script will be stored for persistent access
 SYMLINK_PATH="/usr/local/bin/exittunnel" # Command to run the script
 
-# ---------------- COLORS ----------------
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-MAGENTA='\033[0;35m'
-NC='\033[0m'
-
-# ---------------- FUNCTIONS ----------------
+# --- Helper Functions ---
 
 # Function to get the server's public IPv4 address
 function get_public_ipv4() {
@@ -65,479 +55,653 @@ function press_enter_to_continue() {
 # Displays script and server information at the start
 function display_header() {
     clear # Clear screen for clean display
-    echo "+-------------------------------------------------------------------------+"
-    echo "| _ |"
-    echo "|| | |"
-    echo "|| | ___ _ __ __ _ |"
-    echo "|| | / _ \ '_ \ / _ | |"
-    echo "|| |___| __/ | | | (_| | |"
-    echo "|\_____/\___|_| |_|\__,_| V$SCRIPT_VERSION |" # Updated version
-    echo "+-------------------------------------------------------------------------+"    
-    echo -e "| Telegram Channel : ${MAGENTA}@mr_bxs ${NC}| Version : ${GREEN} $SCRIPT_VERSION ${NC} " # Updated Channel & Version
-    echo "+-------------------------------------------------------------------------+"
-    echo -e "|${GREEN}Server Country |${NC} $(curl -sS --connect-timeout 5 "http://ip-api.com/json/$(get_public_ipv4)" | jq -r '.country' 2>/dev/null || echo "N/A")"
-    echo -e "|${GREEN}Server IP |${NC} $(get_public_ipv4)"
-    echo -e "|${GREEN}Server ISP |${NC} $(curl -sS --connect-timeout 5 "http://ip-api.com/json/$(get_public_ipv4)" | jq -r '.isp' 2>/dev/null || echo "N/A")"
-    echo "+-------------------------------------------------------------------------+"
-    echo -e "|${YELLOW}Please choose an option:${NC}"
-    echo "+-------------------------------------------------------------------------+"
-    echo -e "1- Install new tunnel"
-    echo -e "2- Uninstall tunnel(s)"
-    echo -e "3- Install BBR"
-    echo -e "4- Install cronjob (for HAProxy/VXLAN restart)"
-    echo "+-------------------------------------------------------------------------+"
-    echo -e "\033[0m"
+    echo "================================================================================"
+    echo "Developed by @mr_bxs | GitHub: [Upload to GitHub & put your link here]"
+    echo "Telegram Channel => @mr_bxs"
+    echo "Tunnel script based on Simple Reverse Tunneling (Socks5 + socat)"
+    echo "========================================"
+    echo " 🌐 Server Information"
+    echo "========================================"
+    echo " IPv4 Address: $(get_public_ipv4)"
+    echo " IPv6 Address: $(get_public_ipv6)"
+    echo " Script Version: $SCRIPT_VERSION"
+    echo "========================================\n"
 }
 
-# Install core dependencies (iproute2, net-tools, grep, awk, sudo, iputils-ping, jq, curl, haproxy, iptables)
-function install_dependencies() {
-    echo "[*] Updating package list..."
-    sudo apt update -y > /dev/null 2>&1 || log_action "Warning: apt update failed."
+# --- Core Functions ---
 
-    echo "[*] Installing essential tools: iproute2, net-tools, grep, awk, sudo, iputils-ping, jq, curl, haproxy, iptables, iptables-persistent..."
-    sudo apt install -y iproute2 net-tools grep awk sudo iputils-ping jq curl haproxy iptables iptables-persistent > /dev/null 2>&1
-
-    # Check for successful installation of core tools
-    if ! command -v ip >/dev/null 2>&1; then log_action "[x] iproute2 not installed. Aborting."; echo "Error: iproute2 not installed. Aborting."; press_enter_to_continue; exit 1; fi
-    if ! command -v jq >/dev/null 2>&1; then log_action "[x] jq not installed. Aborting."; echo "Error: jq not installed. Aborting."; press_enter_to_continue; exit 1; fi
-    if ! command -v haproxy >/dev/null 2>&1; then log_action "[x] haproxy not installed. Aborting."; echo "Error: haproxy not installed. Aborting."; press_enter_to_continue; exit 1; fi
-    log_action "✅ All essential dependencies installed."
-}
-
-# Uninstalls all VXLAN tunnels, HAProxy, and cleans up
-function uninstall_all_vxlan() {
-    echo "[!] Deleting all VXLAN interfaces and cleaning up..."
-    log_action "Starting uninstall_all_vxlan function."
-    
-    for i in $(ip -d link show | grep -o 'vxlan[0-9]\+'); do
-        ip link del $i 2>/dev/null
-        log_action "Deleted VXLAN interface: $i"
-    done
-    
-    rm -f /usr/local/bin/vxlan_bridge.sh /etc/ping_vxlan.sh
-    log_action "Removed vxlan_bridge.sh script."
-
-    systemctl disable --now vxlan-tunnel.service 2>/dev/null
-    rm -f /etc/systemd/system/vxlan-tunnel.service
-    log_action "Removed vxlan-tunnel.service."
-    systemctl daemon-reload
-
-    # Stop and disable HAProxy service
-    systemctl stop haproxy 2>/dev/null
-    systemctl disable haproxy 2>/dev/null
-    log_action "Stopped and disabled haproxy service."
-    
-    # Remove HAProxy package
-    sudo apt remove -y haproxy 2>/dev/null
-    sudo apt purge -y haproxy 2>/dev/null
-    sudo apt autoremove -y 2>/dev/null
-    log_action "Removed haproxy package."
-
-    # Remove iptables rules related to VXLAN
-    log_action "Flushing specific iptables rules for VXLAN and restoring defaults."
-    sudo iptables -F INPUT
-    sudo iptables -F FORWARD
-    sudo iptables -F POSTROUTING -t nat
-    sudo iptables -X
-    sudo iptables -Z
-    sudo iptables -P INPUT ACCEPT
-    sudo iptables -P FORWARD ACCEPT
-    sudo iptables -P OUTPUT ACCEPT
-
-    # Restore default iptables rules if a backup exists
-    if [ -f /etc/iptables/rules.v4.bak ]; then
-        sudo cp /etc/iptables/rules.v4.bak /etc/iptables/rules.v4
-        sudo netfilter-persistent reload
-        log_action "Restored iptables rules from backup."
+# Installs socat for TCP/UDP forwarding
+function install_socat() {
+    log_action "📥 Installing 'socat' for TCP/UDP forwarding..."
+    if command -v apt-get &> /dev/null; then
+        sudo apt-get update -y > /dev/null 2>&1
+        sudo apt-get install socat -y > /dev/null 2>&1
+        sudo apt-get install -y iptables-persistent > /dev/null 2>&1 # Ensure iptables-persistent is installed
+    elif command -v yum &> /dev/null; then
+        sudo yum install socat -y > /dev/null 2>&1
+        sudo yum install -y iptables-services > /dev/null 2>&1 # Equivalent for RHEL/CentOS
+    elif command -v dnf &> /dev/null; then
+        sudo dnf install socat -y > /dev/null 2>&1
+        sudo dnf install -y iptables-services > /dev/null 2>&1 # Equivalent for Fedora
     else
-        log_action "No iptables backup found. Ensure your firewall is configured as desired."
+        log_action "❌ Error: Could not detect package manager (apt, yum, dnf). Please install socat and iptables-persistent manually."
+        echo "Error: Could not install 'socat' and 'iptables-persistent'. Please install them manually."
+        press_enter_to_continue
+        return 1
     fi
 
-    # Remove related cronjobs
-    crontab -l 2>/dev/null | grep -v 'systemctl restart haproxy' | grep -v 'systemctl restart vxlan-tunnel' | grep -v '/etc/ping_vxlan.sh' > /tmp/cron_tmp || true
-    crontab /tmp/cron_tmp
-    rm -f /tmp/cron_tmp
-    log_action "Removed related cronjobs."
-    echo "[+] All VXLAN tunnels and related components deleted."
+    if ! command -v socat &> /dev/null; then
+        log_action "❌ 'socat' installation failed."
+        echo "Error: 'socat' could not be installed. Please check your internet connection or install manually."
+        return 1
+    else
+        log_action "✅ 'socat' installed successfully."
+        echo "'socat' installed."
+        return 0
+    fi
+}
+
+# Installs Dante Server (Socks5 Proxy) on Foreign Server
+function install_dante_server() {
+    log_action "📥 Installing 'dante-server' (Socks5 Proxy) on Foreign Server..."
+    if command -v apt-get &> /dev/null; then
+        sudo apt-get update -y > /dev/null 2>&1
+        sudo apt-get install dante-server -y > /dev/null 2>&1
+    elif command -v yum &> /dev/null; then
+        sudo yum install dante-server -y > /dev/null 2>&1
+    elif command -v dnf &> /dev/null; then
+        sudo dnf install dante-server -y > /dev/null 2>&1
+    else
+        log_action "❌ Error: Could not detect package manager (apt, yum, dnf). Please install dante-server manually."
+        echo "Error: Could not install 'dante-server'. Please install it manually."
+        press_enter_to_continue
+        return 1
+    fi
+
+    if ! command -v danted &> /dev/null; then
+        log_action "❌ 'dante-server' installation failed."
+        echo "Error: 'dante-server' could not be installed. Please check your internet connection or install manually."
+        return 1
+    else
+        log_action "✅ 'dante-server' installed successfully."
+        echo "'dante-server' installed."
+        return 0
+    fi
+}
+
+# --- Tunnel Configuration Functions ---
+
+# Configures Foreign Server as a Socks5 endpoint
+function configure_foreign_socks5_endpoint() {
+    echo "\n=== Configure Foreign Server (Socks5 Endpoint) ==="
+    echo "This server will run a Socks5 proxy to provide internet access."
+    echo "Type 'back' at any prompt to return to the previous menu."
+
+    if ! command -v danted &> /dev/null; then
+        echo "'dante-server' is not installed. Installing now..."
+        if ! install_dante_server; then
+            echo "Failed to install dante-server. Cannot configure."
+            return
+        fi
+    fi
+
+    read -p "🔸 Choose a Port for Socks5 (e.g., 2078): " SOCKS5_PORT
+    [[ "$SOCKS5_PORT" == "back" ]] && return
+    if ! [[ "$SOCKS5_PORT" =~ ^[0-9]+$ ]] || [ "$SOCKS5_PORT" -lt 1 ] || [ "$SOCKS5_PORT" -gt 65535 ]; then
+        echo "Invalid port number. Please enter a number between 1 and 65535."
+        press_enter_to_continue
+        return
+    fi
+
+    read -p "🔸 Set a Username for Socks5 authentication: " SOCKS5_USERNAME
+    [[ "$SOCKS5_USERNAME" == "back" ]] && return
+    if [ -z "$SOCKS5_USERNAME" ]; then
+        echo "Username cannot be empty. Please enter a username."
+        press_enter_to_continue
+        return
+    fi
+
+    read -p "🔸 Set a Strong Password for Socks5 authentication: " SOCKS5_PASSWORD
+    [[ "$SOCKS5_PASSWORD" == "back" ]] && return
+    if [ -z "$SOCKS5_PASSWORD" ]; then
+        echo "Password cannot be empty. Please enter a password."
+        press_enter_to_continue
+        return
+    fi
+
+    mkdir -p "$SOCKS5_CONFIG_DIR"
+    local SOCKS5_CONF_FILE="$SOCKS5_CONFIG_DIR/danted.conf"
+
+    # Create user for Dante
+    if ! id -u "$SOCKS5_USERNAME" >/dev/null 2>&1; then
+        log_action "Creating system user '$SOCKS5_USERNAME' for Dante..."
+        sudo useradd -r -s /bin/false "$SOCKS5_USERNAME"
+        if [ $? -ne 0 ]; then
+            log_action "❌ Failed to create system user '$SOCKS5_USERNAME'."
+            echo "Failed to create system user. Please check permissions."
+            press_enter_to_continue
+            return 1
+        fi
+    fi
+    log_action "Setting password for user '$SOCKS5_USERNAME'..."
+    echo -e "$SOCKS5_PASSWORD\n$SOCKS5_PASSWORD" | sudo passwd "$SOCKS5_USERNAME" > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        log_action "❌ Failed to set password for user '$SOCKS5_USERNAME'."
+        echo "Failed to set password for system user. Please check permissions."
+        press_enter_to_continue
+        return 1
+    fi
+
+    # Create danted.conf
+    cat > "$SOCKS5_CONF_FILE" <<EOF
+logoutput: syslog
+user.privileged: root
+user.notprivileged: nobody
+
+# The listening network interface or address.
+internal: 0.0.0.0 port = $SOCKS5_PORT
+
+# The proxy will use the external interface to connect to the Internet.
+external: $(get_public_ipv4) # Use actual public IP as external interface
+
+# Authentication method
+method: username none
+
+# Client rules: allow connection from ANY IP (including Iran Server)
+clientmethod: username
+client pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: error connect disconnect
+}
+client block {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: error
+}
+
+# Socks rules: allow connections to any destination
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    protocol: tcp udp
+    log: error connect disconnect
+    # Authenticate all users
+    user: $SOCKS5_USERNAME
+}
+socks block {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: error
+}
+EOF
+    log_action "✅ Dante Socks5 config created: $SOCKS5_CONF_FILE"
+
+    # Store user/pass/port for listing (not directly used by dante, but for info)
+    mkdir -p "$TUNNEL_CONFIG_DIR"
+    echo "foreign_socks5:${SOCKS5_USERNAME}:${SOCKS5_PASSWORD}:${SOCKS5_PORT}" > "$TUNNEL_CONFIG_DIR/foreign_socks5.conf"
+
+    log_action "🔄 Attempting to restart Dante Socks5 service..."
+    systemctl daemon-reload > /dev/null 2>&1
+    systemctl restart "$SOCKS5_SERVICE_NAME" > /dev/null 2>&1
+
+    if systemctl is-active --quiet "$SOCKS5_SERVICE_NAME"; then
+        log_action "✅ Dante Socks5 Server configured and running on port $SOCKS5_PORT (Foreign Server)."
+        local server_ip=$(get_public_ipv4)
+        
+        echo "\n🎉 Dante Socks5 Server on your Foreign Server is ready!"
+        echo "--------------------------------------------------------------------------------"
+        echo " Connection Details for Iran Server (Socks5 Client):"
+        echo " Socks5 Server IP : ${server_ip}"
+        echo " Socks5 Port : $SOCKS5_PORT"
+        echo " Username : $SOCKS5_USERNAME"
+        echo " Password : $SOCKS5_PASSWORD"
+        echo "--------------------------------------------------------------------------------"
+        echo "IMPORTANT: Open port $SOCKS5_PORT (TCP and UDP if possible) in your Foreign Server's firewall!"
+        echo "Now, go to your Iran Server and configure the reverse tunnel."
+    else
+        log_action "❌ Failed to start Dante Socks5 Server. Please check logs for details."
+        echo "❌ Dante Socks5 Server failed to start."
+        echo " Check logs with 'journalctl -u $SOCKS5_SERVICE_NAME -f'."
+    fi
     press_enter_to_continue
 }
 
-# Installs BBR congestion control
-function install_bbr() {
-    echo "Running BBR script..."
-    log_action "Starting BBR installation."
-    curl -fsSL https://raw.githubusercontent.com/MrAminiDev/NetOptix/main/scripts/bbr.sh -o /tmp/bbr.sh
-    bash /tmp/bbr.sh
-    rm -f /tmp/bbr.sh
-    log_action "✅ BBR installation script executed."
+# Configures Iran Server for reverse tunneling using iptables/socat
+function configure_iran_reverse_tunnel() {
+    echo "\n=== Configure Iran Server (Reverse Tunnel) ==="
+    echo "This server will establish a reverse tunnel to the Foreign Socks5 Proxy."
+    echo "X-UI/Sanayi will be installed on THIS server."
+    echo "Type 'back' at any prompt to return to the previous menu."
+
+    if ! command -v socat &> /dev/null; then
+        echo "'socat' is not installed. Installing now..."
+        if ! install_socat; then
+            echo "Failed to install socat. Cannot create tunnel."
+            return
+        fi
+    fi
+
+    read -p "🔸 Foreign Socks5 Server IP: " FOREIGN_SOCKS5_IP
+    [[ "$FOREIGN_SOCKS5_IP" == "back" ]] && return
+    if [ -z "$FOREIGN_SOCKS5_IP" ]; then echo "IP cannot be empty."; press_enter_to_continue; return 1; fi
+
+    read -p "🔸 Foreign Socks5 Port: " FOREIGN_SOCKS5_PORT
+    [[ "$FOREIGN_SOCKS5_PORT" == "back" ]] && return
+    if ! [[ "$FOREIGN_SOCKS5_PORT" =~ ^[0-9]+$ ]] || [ "$FOREIGN_SOCKS5_PORT" -lt 1 ] || [ "$FOREIGN_SOCKS5_PORT" -gt 65535 ]; then
+        echo "Invalid port. Please enter a number between 1 and 65535."
+        press_enter_to_continue
+        return
+    fi
+
+    read -p "🔸 Socks5 Username: " SOCKS5_USERNAME
+    [[ "$SOCKS5_USERNAME" == "back" ]] && return
+    if [ -z "$SOCKS5_USERNAME" ]; then echo "Username cannot be empty."; press_enter_to_continue; return 1; fi
+
+    read -p "🔸 Socks5 Password: " SOCKS5_PASSWORD
+    [[ "$SOCKS5_PASSWORD" == "back" ]] && return
+    if [ -z "$SOCKS5_PASSWORD" ]; then echo "Password cannot be empty."; press_enter_to_continue; return 1; fi
+
+    read -p "🔸 Local Port on Iran Server for OUTGOING connections (e.g., 1080 - used by iptables, must be free): " LOCAL_SOCKS_OUT_PORT
+    [[ "$LOCAL_SOCKS_OUT_PORT" == "back" ]] && return
+    if ! [[ "$LOCAL_SOCKS_OUT_PORT" =~ ^[0-9]+$ ]] || [ "$LOCAL_SOCKS_OUT_PORT" -lt 1 ] || [ "$LOCAL_SOCKS_OUT_PORT" -gt 65535 ]; then
+        echo "Invalid port. Please enter a number between 1 and 65535."
+        press_enter_to_continue
+        return
+    fi
+
+    # Create systemd service for socat client (reverse tunnel part)
+    local SERVICE_NAME="exittunnel-reverse-client-${LOCAL_SOCKS_OUT_PORT}"
+    local SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+
+    mkdir -p "$TUNNEL_CONFIG_DIR"
+    echo "${FOREIGN_SOCKS5_IP}:${FOREIGN_SOCKS5_PORT}:${SOCKS5_USERNAME}:${SOCKS5_PASSWORD}:${LOCAL_SOCKS_OUT_PORT}" > "$TUNNEL_CONFIG_DIR/iran_reverse_client.conf"
+
+    cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=ExitTunnel Reverse Client on Port ${LOCAL_SOCKS_OUT_PORT}
+After=network.target network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/socat TCP-LISTEN:${LOCAL_SOCKS_OUT_PORT},fork SOCKS5:${FOREIGN_SOCKS5_IP}:${FOREIGN_SOCKS5_PORT},socksclient,socksuser=${SOCKS5_USERNAME},sockspassword=${SOCKS5_PASSWORD}
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    log_action "✅ socat reverse client service config created: ${SERVICE_FILE}"
+
+    systemctl daemon-reload > /dev/null 2>&1
+    systemctl enable "$SERVICE_NAME" --now > /dev/null 2>&1
+
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        log_action "✅ ExitTunnel reverse client started on port ${LOCAL_SOCKS_OUT_PORT} (Iran Server)."
+        echo "\n🎉 ExitTunnel reverse client on your Iran Server is ready!"
+        echo "--------------------------------------------------------------------------------"
+        echo " Traffic from this server will be redirected to local port ${LOCAL_SOCKS_OUT_PORT}."
+        echo " This port (${LOCAL_SOCKS_OUT_PORT}) will then forward to your Foreign Socks5 Proxy."
+        echo "--------------------------------------------------------------------------------"
+        echo "IMPORTANT: Now setting up IPtables rules for automatic redirection (Transparent Proxy)."
+        log_action "Setting up iptables rules for transparent proxy on Iran Server."
+
+        # Save current iptables rules as backup
+        sudo iptables-save > /etc/iptables/rules.v4.bak
+        if command -v ip6tables-save >/dev/null 2>&1; then
+            sudo ip6tables-save > /etc/iptables/rules.v6.bak
+        fi
+
+        # Enable IP forwarding
+        sudo sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
+        log_action "Enabled IPv4 forwarding."
+
+        # Clear existing NAT rules that might conflict (be careful with existing setups)
+        sudo iptables -t nat -F PREROUTING
+        sudo iptables -t nat -F POSTROUTING
+        
+        # Exclude local traffic and traffic to/from VPN/proxy apps
+        # (Assuming X-UI/Sanayi runs on specific UIDs/GIDs, or directly routed traffic)
+        # For simplicity, redirect ALL outgoing TCP traffic to local socks port, excluding local connections.
+        
+        # Create a new chain for SOCKS redirection
+        sudo iptables -t nat -N SOCKS_REDIRECT
+        
+        # Redirect all traffic (except excluded) to local SOCKS port
+        sudo iptables -t nat -A PREROUTING -p tcp -m tcp --dport 80 -j SOCKS_REDIRECT
+        sudo iptables -t nat -A PREROUTING -p tcp -m tcp --dport 443 -j SOCKS_REDIRECT
+        # Add more ports as needed (e.g., 53 for DNS over TCP, etc.)
+        
+        # Redirect to local Socks5 listener
+        sudo iptables -t nat -A SOCKS_REDIRECT -p tcp -j REDIRECT --to-ports "$LOCAL_SOCKS_OUT_PORT"
+        
+        # For outgoing traffic from the server itself (e.g., updates, curl)
+        sudo iptables -t nat -A OUTPUT -p tcp -m tcp --dport 80 -j SOCKS_REDIRECT
+        sudo iptables -t nat -A OUTPUT -p tcp -m tcp --dport 443 -j SOCKS_REDIRECT
+        # IMPORTANT: Exclude X-UI/Sanayi's process if it makes direct connections
+        # This is where 'dekomodor' often uses specific UIDs to exclude.
+        # For this simplified version, assume X-UI/Sanayi will use these redirected ports.
+
+        # Save iptables rules persistently
+        sudo netfilter-persistent save > /dev/null 2>&1
+        log_action "✅ iptables rules for transparent proxy applied and saved."
+        
+        echo "\n--------------------------------------------------------------------------------"
+        echo " Your Iran Server is now configured for transparent proxy via reverse tunnel!"
+        echo " - All outgoing TCP traffic from this server (including X-UI/Sanayi) on ports 80, 443"
+        echo " will be automatically redirected to local port ${LOCAL_SOCKS_OUT_PORT}."
+        echo " - This local port will then forward traffic through the secure Socks5 tunnel"
+        echo " to your Foreign Socks5 Proxy."
+        echo "--------------------------------------------------------------------------------"
+        echo "IMPORTANT: Now install X-UI/Sanayi on this Iran Server."
+        echo " - In X-UI/Sanayi, create your Inbounds (e.g., VLESS/VMess/Trojan) on public ports (e.g., 443, 80)."
+        echo " - You DO NOT need to configure any special Outbound in X-UI/Sanayi for this tunnel."
+        echo " X-UI/Sanayi's outgoing traffic will be AUTOMATICALLY redirected by iptables."
+        echo " - Ensure your X-UI/Sanayi Inbound ports (e.g., 443, 80) are open in your Iran Server's firewall!"
+        echo "This setup allows clients to connect to your Iran IP, and Exit IP will be Iran's IP."
+    else
+        log_action "❌ Failed to start ExitTunnel reverse client. Check logs."
+        echo "❌ ExitTunnel reverse client failed to start."
+        echo " Check logs with 'journalctl -u ${SERVICE_NAME} -f'."
+    fi
     press_enter_to_continue
 }
 
-# Installs cronjob for HAProxy/VXLAN restart
-function install_cronjob() {
-    while true; do
-        read -p "How many hours between each restart? (1-24): " cron_hours
-        if [[ $cron_hours =~ ^[0-9]+$ ]] && (( cron_hours >= 1 && cron_hours <= 24 )); then
-            break
-        else
-            echo "Invalid input. Please enter a number between 1 and 24."
+# --- Tunnel Management Functions ---
+
+# Lists existing tunnel configurations and offers deletion
+function list_and_delete_tunnels() {
+    echo "\n=== My ExitTunnel Configurations ==="
+    local configs_found=0
+    
+    mkdir -p "$TUNNEL_CONFIG_DIR" # Ensure config directory exists
+    
+    # List Foreign Socks5 Server config
+    if [ -f "$TUNNEL_CONFIG_DIR/foreign_socks5.conf" ]; then
+        configs_found=1
+        local config_data=$(cat "$TUNNEL_CONFIG_DIR/foreign_socks5.conf")
+        local username=$(echo "$config_data" | awk -F':' '{print $2}')
+        local password=$(echo "$config_data" | awk -F':' '{print $3}')
+        local port=$(echo "$config_data" | awk -F':' '{print $4}')
+        local server_ip=$(get_public_ipv4)
+
+        echo -e "\n[1] Role: Foreign Server (Dante Socks5 Proxy)"
+        echo " Config File: $SOCKS5_CONFIG_DIR/danted.conf"
+        echo " --- Details ---"
+        echo " Server IP : ${server_ip}"
+        echo " Port : $port"
+        echo " Username : $username"
+        echo " Password : $password"
+        echo " ---------------"
+        echo " Status: $(systemctl is-active "$SOCKS5_SERVICE_NAME" 2>/dev/null || echo "inactive")"
+    fi
+
+    # List Iran Reverse Client config
+    local service_name_iran="exittunnel-reverse-client-"
+    for config_file in "$TUNNEL_CONFIG_DIR"/iran_reverse_client.conf; do
+        if [ -f "$config_file" ]; then
+            configs_found=1
+            local config_data=$(cat "$config_file")
+            local foreign_ip=$(echo "$config_data" | awk -F':' '{print $1}')
+            local foreign_port=$(echo "$config_data" | awk -F':' '{print $2}')
+            local username=$(echo "$config_data" | awk -F':' '{print $3}')
+            local local_port=$(echo "$config_data" | awk -F':' '{print $5}')
+            local current_service_name="${service_name_iran}${local_port}"
+
+            echo -e "\n[2] Role: Iran Server (Reverse Client)"
+            echo " Config File: $config_file"
+            echo " --- Details ---"
+            echo " Foreign Socks5 IP : $foreign_ip"
+            echo " Foreign Socks5 Port: $foreign_port"
+            echo " Socks5 Username : $username"
+            echo " Local Redirect Port: $local_port"
+            echo " ---------------"
+            echo " Status: $(systemctl is-active "$current_service_name" 2>/dev/null || echo "inactive")"
         fi
     done
-    log_action "Setting up cronjob for restarts every $cron_hours hour(s)."
-    # Remove any previous cronjobs for these services
-    crontab -l 2>/dev/null | grep -v 'systemctl restart haproxy' | grep -v 'systemctl restart vxlan-tunnel' | grep -v 'systemctl reload iptables' > /tmp/cron_tmp || true
-    echo "0 */$cron_hours * * * systemctl restart haproxy >/dev/null 2>&1" >> /tmp/cron_tmp
-    echo "0 */$cron_hours * * * systemctl restart vxlan-tunnel >/dev/null 2>&1" >> /tmp/cron_tmp
-    echo "0 */$cron_hours * * * /sbin/iptables-restore < /etc/iptables/rules.v4 >/dev/null 2>&1" >> /tmp/cron_tmp # Restore iptables
-    crontab /tmp/cron_tmp
-    rm -f /tmp/cron_tmp
-    echo -e "${GREEN}Cronjob set successfully to restart haproxy and vxlan-tunnel every $cron_hours hour(s).${NC}"
-    log_action "✅ Cronjob configured."
+
+    if [ "$configs_found" -eq 0 ]; then
+        echo "No ExitTunnel configurations found."
+    else
+        echo -e "\n-----------------------------------------"
+        read -p "Enter the number of the tunnel config to delete (1 for Foreign Socks5, 2 for Iran Reverse Client), or 'back' to return: " TUNNEL_NUM_TO_DELETE
+        [[ "$TUNNEL_NUM_TO_DELETE" =~ ^[bB][aA][cC][kK]$ ]] && return
+
+        if [[ "$TUNNEL_NUM_TO_DELETE" == "1" ]]; then # Delete Foreign Socks5 config
+            local config_file_to_delete="$TUNNEL_CONFIG_DIR/foreign_socks5.conf"
+            local dante_config_file="$SOCKS5_CONFIG_DIR/danted.conf"
+            if [ -f "$config_file_to_delete" ]; then
+                read -p "Are you sure you want to delete Foreign Socks5 config? (y/N): " CONFIRM_DELETE
+                [[ "$CONFIRM_DELETE" =~ ^[bB][aA][cC][kK]$ ]] && return
+                if [[ "$CONFIRM_DELETE" =~ ^[yY]$ ]]; then
+                    log_action "🗑 Stopping and disabling Dante Socks5 service..."
+                    systemctl stop "$SOCKS5_SERVICE_NAME" > /dev/null 2>&1
+                    systemctl disable "$SOCKS5_SERVICE_NAME" > /dev/null 2>&1
+                    log_action "🗑 Deleting Dante config file and user..."
+                    local username_to_remove=$(head -n 1 "$config_file_to_delete" | awk -F':' '{print $2}')
+                    if id -u "$username_to_remove" >/dev/null 2>&1; then
+                        sudo userdel "$username_to_remove" > /dev/null 2>&1
+                    fi
+                    rm -f "$config_file_to_delete"
+                    rm -f "$dante_config_file"
+                    rm -rf "$SOCKS5_CONFIG_DIR" # Clean up dante dir
+                    systemctl daemon-reload > /dev/null 2>&1
+                    log_action "✅ Foreign Socks5 tunnel deleted."
+                    echo "Foreign Socks5 tunnel config deleted and service stopped."
+                else
+                    log_action "❌ Deletion cancelled."
+                }
+            else
+                echo "Foreign Socks5 config not found."
+            fi
+        elif [[ "$TUNNEL_NUM_TO_DELETE" == "2" ]]; then # Delete Iran Reverse Client config
+            local config_file_to_delete="$TUNNEL_CONFIG_DIR/iran_reverse_client.conf"
+            local local_port_to_delete=$(head -n 1 "$config_file_to_delete" | awk -F':' '{print $5}')
+            local service_to_delete="${service_name_iran}${local_port_to_delete}"
+            local service_file_to_delete="/etc/systemd/system/${service_to_delete}.service"
+
+            if [ -f "$config_file_to_delete" ]; then
+                read -p "Are you sure you want to delete Iran Reverse Client config? (y/N): " CONFIRM_DELETE
+                [[ "$CONFIRM_DELETE" =~ ^[bB][aA][cC][kK]$ ]] && return
+                if [[ "$CONFIRM_DELETE" =~ ^[yY]$ ]]; then
+                    log_action "🗑 Stopping and disabling reverse client service: ${service_to_delete}..."
+                    systemctl stop "$service_to_delete" > /dev/null 2>&1
+                    systemctl disable "$service_to_delete" > /dev/null 2>&1
+                    log_action "🗑 Deleting service file and config: ${service_file_to_delete} and ${config_file_to_delete}..."
+                    rm -f "$service_file_to_delete"
+                    rm -f "$config_file_to_delete"
+                    systemctl daemon-reload > /dev/null 2>&1
+                    
+                    log_action "🗑 Flushing specific iptables rules for transparent proxy on Iran Server."
+                    # Restore iptables to pre-redirect state. This might be tricky if other rules exist.
+                    # Best practice: Revert to backup, or remove specific chains/rules
+                    sudo iptables -t nat -D PREROUTING -p tcp -m tcp --dport 80 -j SOCKS_REDIRECT 2>/dev/null || true
+                    sudo iptables -t nat -D PREROUTING -p tcp -m tcp --dport 443 -j SOCKS_REDIRECT 2>/dev/null || true
+                    sudo iptables -t nat -D OUTPUT -p tcp -m tcp --dport 80 -j SOCKS_REDIRECT 2>/dev/null || true
+                    sudo iptables -t nat -D OUTPUT -p tcp -m tcp --dport 443 -j SOCKS_REDIRECT 2>/dev/null || true
+                    sudo iptables -t nat -F SOCKS_REDIRECT
+                    sudo iptables -t nat -X SOCKS_REDIRECT
+                    sudo sysctl -w net.ipv4.ip_forward=0 > /dev/null 2>&1 # Disable forwarding if not needed by other services
+                    sudo netfilter-persistent save > /dev/null 2>&1
+                    log_action "✅ Iran Reverse Client tunnel deleted and iptables rules reset."
+                    echo "Iran Reverse Client tunnel config deleted and service stopped. IPtables rules reset."
+                else
+                    log_action "❌ Deletion cancelled."
+                fi
+            else
+                echo "Iran Reverse Client config not found."
+            fi
+        else
+            echo "Invalid option. Please choose 1, 2, or 'back'."
+        fi
+    fi
     press_enter_to_continue
 }
 
-# --- Function to handle persistent command setup ---
-function setup_persistent_command() {
-    local SCRIPT_NAME=$(basename "$0") 
-    local PERSISTENT_SCRIPT_PATH="/usr/local/bin/${SCRIPT_NAME}"
-    local SYMLINK_COMMAND="exittunnel" # The command you want to use (e.g., 'exittunnel')
 
-    if [ ! -f "$PERSISTENT_SCRIPT_PATH" ] || [ "$(readlink "$SYMLINK_COMMAND" 2>/dev/null)" != "$PERSISTENT_SCRIPT_PATH" ]; then
-        echo "[*] Setting up persistent command '$SYMLINK_COMMAND'..."
-        log_action "Setting up persistent command."
-        sudo cp "$0" "$PERSISTENT_SCRIPT_PATH" # Copy the current running script to a persistent location
-        sudo chmod +x "$PERSISTENT_SCRIPT_PATH"
-        sudo ln -sf "$PERSISTENT_SCRIPT_PATH" "$SYMLINK_COMMAND" # Create a symlink
-        echo "✅ '$SYMLINK_COMMAND' command is now set up. You can run the script by typing '$SYMLINK_COMMAND' from anywhere."
+# --- Service Status & Logs ---
+function check_tunnel_status() {
+    echo "\n=== ExitTunnel Service Status & Logs ==="
+    local configs_found=0
+    mkdir -p "$TUNNEL_CONFIG_DIR"
+
+    # Check Dante status (Foreign Server)
+    if [ -f "$TUNNEL_CONFIG_DIR/foreign_socks5.conf" ]; then
+        configs_found=1
+        echo -e "\n--- Service: Dante Socks5 Server ---"
+        systemctl status "$SOCKS5_SERVICE_NAME" --no-pager 2>/dev/null || echo "Service not found or inactive."
+        echo "--- Last 5 Logs for Dante Socks5 Server ---"
+        journalctl -u "$SOCKS5_SERVICE_NAME" -n 5 --no-pager 2>/dev/null || echo "No logs found."
+        echo "-----------------------------------"
+    fi
+
+    # Check socat reverse client status (Iran Server)
+    local service_name_iran_prefix="exittunnel-reverse-client-"
+    for config_file in "$TUNNEL_CONFIG_DIR"/iran_reverse_client.conf; do
+        if [ -f "$config_file" ]; then
+            configs_found=1
+            local local_port_check=$(head -n 1 "$config_file" | awk -F':' '{print $5}')
+            local current_service_name="${service_name_iran_prefix}${local_port_check}"
+            echo -e "\n--- Service: ${current_service_name} ---"
+            systemctl status "$current_service_name" --no-pager 2>/dev/null || echo "Service not found or inactive."
+            echo "--- Last 5 Logs for ${current_service_name} ---"
+            journalctl -u "$current_service_name" -n 5 --no-pager 2>/dev/null || echo "No logs found."
+            echo "-----------------------------------"
+        fi
+    done
+
+    if [ "$configs_found" -eq 0 ]; then
+        echo "No ExitTunnel configurations found to check status."
+    fi
+    echo "========================================\n"
+    press_enter_to_continue
+}
+
+# --- Main Menu Logic ---
+function main_menu() {
+    while true; do
+        display_header
+        echo "Select an option:"
+        echo "1) Configure Foreign Server (Socks5 Endpoint)"
+        echo "2) Configure Iran Server (Reverse Client)"
+        echo "3) List & Delete Tunnels"
+        echo "4) Check Tunnel Status & Logs"
+        echo "5) Uninstall All ExitTunnel Components"
+        echo "6) Exit"
+        read -p "👉 Your choice: " CHOICE
+
+        case $CHOICE in
+            1)
+                configure_foreign_socks5_endpoint
+                ;;
+            2)
+                configure_iran_reverse_tunnel
+                ;;
+            3)
+                list_and_delete_tunnels
+                ;;
+            4)
+                check_tunnel_status
+                ;;
+            5)
+                # Combined uninstall for both Dante and socat components
+                read -p "Are you sure you want to remove ALL ExitTunnel configs and associated software (Dante, socat)? (y/N): " CONFIRM_ALL_UNINSTALL
+                if [[ "$CONFIRM_ALL_UNINSTALL" =~ ^[yY]$ ]]; then
+                    log_action "Initiating full ExitTunnel uninstall."
+                    
+                    # Stop and disable all socat tunnel services
+                    for service_file in /etc/systemd/system/exittunnel-*.service; do
+                        if [ -f "$service_file" ]; then
+                            local service_name_to_stop=$(basename "$service_file" | sed 's/\.service$//')
+                            systemctl stop "$service_name_to_stop" > /dev/null 2>&1
+                            systemctl disable "$service_name_to_stop" > /dev/null 2>&1
+                            rm -f "$service_file"
+                            log_action "Stopped and removed socat service: $service_name_to_stop"
+                        fi
+                    done
+                    
+                    # Stop and disable Dante
+                    systemctl stop "$SOCKS5_SERVICE_NAME" > /dev/null 2>&1
+                    systemctl disable "$SOCKS5_SERVICE_NAME" > /dev/null 2>&1
+                    
+                    # Remove all configs
+                    rm -rf "$TUNNEL_CONFIG_DIR"
+                    rm -rf "$SOCKS5_CONFIG_DIR"
+                    systemctl daemon-reload > /dev/null 2>&1
+                    log_action "Removed all ExitTunnel configs and stopped services."
+
+                    # Remove system users created for Dante
+                    # This requires parsing the config file which might have been deleted,
+                    # so this part might need manual cleanup if user wants to be super precise.
+                    # For simplicity, we just remove if a user with standard name exists.
+                    log_action "Attempting to remove associated system users (e.g., 'socksuser' if standard)."
+                    if id -u "socksuser" >/dev/null 2>&1; then # A common user Dante might create/use
+                        sudo userdel "socksuser" > /dev/null 2>&1
+                    fi
+                    
+                    # Uninstall socat
+                    log_action "Attempting to uninstall 'socat'..."
+                    if command -v apt-get &> /dev/null; then sudo apt-get remove socat -y > /dev/null 2>&1; sudo apt-get autoremove -y > /dev/null 2>&1; fi
+                    elif command -v yum &> /dev/null; then sudo yum remove socat -y > /dev/null 2>&1; sudo yum autoremove -y > /dev/null 2>&1; fi
+                    elif command -v dnf &> /dev/null; then sudo dnf remove socat -y > /dev/null 2>&1; sudo dnf autoremove -y > /dev/null 2>&1; fi
+                    else log_action "⚠️ Warning: Cannot auto-uninstall 'socat'."; fi
+                    
+                    # Uninstall dante-server
+                    log_action "Attempting to uninstall 'dante-server'..."
+                    if command -v apt-get &> /dev/null; then sudo apt-get remove dante-server -y > /dev/null 2>&1; sudo apt-get autoremove -y > /dev/null 2>&1; fi
+                    elif command -v yum &> /dev/null; then sudo yum remove dante-server -y > /dev/null 2>&1; sudo yum autoremove -y > /dev/null 2>&1; fi
+                    elif command -v dnf &> /dev/null; then sudo dnf remove dante-server -y > /dev/null 2>&1; sudo dnf autoremove -y > /dev/null 2>&1; fi
+                    else log_action "⚠️ Warning: Cannot auto-uninstall 'dante-server'."; fi
+
+                    # Reset iptables rules created by this script
+                    log_action "Attempting to reset iptables rules created by ExitTunnel."
+                    # This attempts to remove just the rules we added. More robust than full flush.
+                    sudo iptables -t nat -D PREROUTING -p tcp -m tcp --dport 80 -j SOCKS_REDIRECT 2>/dev/null || true
+                    sudo iptables -t nat -D PREROUTING -p tcp -m tcp --dport 443 -j SOCKS_REDIRECT 2>/dev/null || true
+                    sudo iptables -t nat -D OUTPUT -p tcp -m tcp --dport 80 -j SOCKS_REDIRECT 2>/dev/null || true
+                    sudo iptables -t nat -D OUTPUT -p tcp -m tcp --dport 443 -j SOCKS_REDIRECT 2>/dev/null || true
+                    sudo iptables -t nat -F SOCKS_REDIRECT 2>/dev/null || true # Flush the chain
+                    sudo iptables -t nat -X SOCKS_REDIRECT 2>/dev/null || true # Delete the chain
+                    sudo sysctl -w net.ipv4.ip_forward=0 > /dev/null 2>&1 # Disable forwarding
+                    sudo netfilter-persistent save > /dev/null 2>&1
+                    log_action "✅ iptables rules reset."
+
+                    echo "All ExitTunnel components uninstalled and cleanup attempted. You might need manual checks."
+                else
+                    echo "Cleanup cancelled."
+                fi
+                press_enter_to_continue
+                ;;
+            6)
+                log_action "Exiting script."
+                echo "Exiting ExitTunnel Manager. Goodbye!"
+                exit 0
+                ;;
+            *)
+                echo "Invalid option. Please choose a number from the menu."
+                press_enter_to_continue
+                ;;
+        esac
+    done
+}
+
+
+# --- Initial Setup for Persistent Command ---
+function setup_persistent_command() {
+    if [ ! -f "$SYMLINK_PATH" ] || [ "$(readlink "$SYMLINK_PATH" 2>/dev/null)" != "$SCRIPT_PATH" ]; then
+        log_action "Configuring persistent 'exittunnel' command."
+        sudo cp "$0" "$SCRIPT_PATH" # Copy the current running script to a persistent location
+        sudo chmod +x "$SCRIPT_PATH"
+        sudo ln -sf "$SCRIPT_PATH" "$SYMLINK_PATH" # Create a symlink to make it accessible system-wide
+        echo "✅ 'exittunnel' command is now set up. You can run the script by typing 'exittunnel' from anywhere."
         press_enter_to_continue
         log_action "Persistent command setup complete."
     fi
 }
 
-# Function to configure HAProxy for port forwarding
-function configure_haproxy_port_forwarding() {
-    echo "[*] Configuring HAProxy for automatic port forwarding..."
-    log_action "Starting HAProxy configuration for port forwarding."
-
-    # Ensure haproxy is installed
-    if ! command -v haproxy >/dev/null 2>&1; then
-        echo "[x] HAProxy is not installed. Installing..."
-        sudo apt update > /dev/null 2>&1 && sudo apt install -y haproxy > /dev/null 2>&1
-    fi
-
-    # Ensure config directory exists
-    sudo mkdir -p /etc/haproxy
-
-    # Default HAProxy config file
-    local CONFIG_FILE="/etc/haproxy/haproxy.cfg"
-    local BACKUP_FILE="/etc/haproxy/haproxy.cfg.bak"
-
-    # Backup old config if it's not our default template
-    if [ -f "$CONFIG_FILE" ]; then
-        if ! grep -q "### ExitTunnel HAProxy Config ###" "$CONFIG_FILE"; then
-            cp "$CONFIG_FILE" "$BACKUP_FILE"
-            log_action "Backed up existing HAProxy config to $BACKUP_FILE"
-        fi
-    fi
-
-    # Write base config for HAProxy
-    cat <<EOL > "$CONFIG_FILE"
-### ExitTunnel HAProxy Config ###
-global
-    chroot /var/lib/haproxy
-    stats socket /run/haproxy/admin.sock mode 660 level admin
-    stats timeout 30s
-    user haproxy
-    group haproxy
-    daemon
-    maxconn 4096
-
-defaults
-    mode tcp
-    option dontlognull
-    timeout connect 5000ms
-    timeout client 50000ms
-    timeout server 50000ms
-    retries 3
-    option tcpka
-EOL
-
-    local local_public_ip=$(hostname -I | awk '{print $1}' | head -n1)
-    local vxlan_internal_ip="${IRAN_VXLAN_IP%/*}" # 30.0.0.1 for Iran side
-
-    read -p "Enter public ports on this server (Iran) to forward (comma-separated, e.g., 80,443): " user_public_ports
-    IFS=',' read -ra public_ports_array <<< "$user_public_ports"
-
-    for public_port in "${public_ports_array[@]}"; do
-        cat <<EOL >> "$CONFIG_FILE"
-
-frontend frontend_$public_port
-    bind $local_public_ip:$public_port # Bind to public IP
-    default_backend backend_$public_port
-    option tcpka
-
-backend backend_$public_port
-    option tcpka
-    server server1 $vxlan_internal_ip:$public_port check maxconn 2048 # Forward to VXLAN internal IP
-EOL
-    done
-
-    # Validate haproxy config
-    if haproxy -c -f "$CONFIG_FILE"; then
-        echo "[*] Restarting HAProxy service..."
-        systemctl restart haproxy
-        systemctl enable haproxy
-        echo -e "${GREEN}HAProxy configured and restarted successfully for port forwarding.${NC}"
-        log_action "✅ HAProxy configured and restarted."
-    else
-        echo -e "${YELLOW}Warning: HAProxy configuration is invalid! Attempting to restore backup or clean up.${NC}"
-        log_action "HAProxy config validation failed."
-        [ -f "$BACKUP_FILE" ] && cp "$BACKUP_FILE" "$CONFIG_FILE" && systemctl restart haproxy && log_action "Restored HAProxy config from backup."
-        echo "HAProxy config is invalid. Please check manually."
-    fi
-}
-
-
-# --- Main tunnel setup logic ---
-function install_new_tunnel_core() {
-    # Check if ip command is available (already checked by install_dependencies)
-    if ! command -v ip >/dev/null 2>&1; then
-        echo "[x] iproute2 is not installed. Aborting tunnel setup."
-        press_enter_to_continue
-        return 1
-    fi
-
-    # ------------- VARIABLES --------------
-    # VNI, VXLAN_IF, IRAN_VXLAN_IP, KHAREJ_VXLAN_IP are global
-
-    # --------- Choose Server Role ----------
-    echo "Choose server role:"
-    echo "1- Iran (Border Server with Auto-Dekomodor)"
-    echo "2- Kharej (Main Server with Sanayi/X-UI)"
-    read -p "Enter choice (1/2): " role_choice
-
-    local REMOTE_IP="" # Public IP of the other server
-    local MY_VXLAN_IP="" # Internal VXLAN IP for this server
-
-    if [[ "$role_choice" == "1" ]]; then # Iran Server
-        read -p "Enter Foreign Server Public IP (Kharej IP): " KHAREJ_IP
-        if [ -z "$KHAREJ_IP" ]; then echo "IP cannot be empty."; press_enter_to_continue; return 1; fi
-
-        read -p "Enter Tunnel Port (e.g., 4789 - standard VXLAN UDP port): " DSTPORT
-        # Input validation for DSTPORT
-        while true; do
-            if [[ $DSTPORT =~ ^[0-9]+$ ]] && (( DSTPORT >= 1 && DSTPORT <= 65535 )); then
-                break
-            else
-                echo "Invalid port. Please enter a number between 1 and 65535."
-                read -p "Tunnel port: " DSTPORT
-            fi
-        done
-
-        # Configure HAProxy for automatic dekomodor (port forwarding from public to VXLAN internal IP)
-        configure_haproxy_port_forwarding # This will ask for public ports and forward to VXLAN IP
-
-        MY_VXLAN_IP=$IRAN_VXLAN_IP
-        REMOTE_IP=$KHAREJ_IP
-        log_action "Configuring Iran Server (Forwarder)."
-
-    elif [[ "$role_choice" == "2" ]]; then # Kharej Server
-        read -p "Enter Iran Server Public IP (IRAN IP): " IRAN_IP
-        if [ -z "$IRAN_IP" ]; then echo "IP cannot be empty."; press_enter_to_continue; return 1; fi
-
-        read -p "Enter Tunnel Port (e.g., 4789 - Must match Iran Server's Tunnel Port): " DSTPORT
-        # Input validation for DSTPORT
-        while true; do
-            if [[ $DSTPORT =~ ^[0-9]+$ ]] && (( DSTPORT >= 1 && DSTPORT <= 65535 )); then
-                break
-            else
-                echo "Invalid port. Please enter a number between 1 and 65535."
-                read -p "Tunnel port: " DSTPORT
-            fi
-        done
-
-        MY_VXLAN_IP=$KHAREJ_VXLAN_IP
-        REMOTE_IP=$IRAN_IP
-        log_action "Configuring Kharej Server (Receiver)."
-
-    else
-        echo "[x] Invalid role selected. Aborting tunnel setup."
-        press_enter_to_continue
-        return 1
-    fi
-
-    # Detect default interface for VXLAN
-    INTERFACE=$(ip route get 1.1.1.1 | awk '{print $5}' | head -n1)
-    if [ -z "$INTERFACE" ]; then
-        echo "[x] Could not detect main network interface. Aborting VXLAN setup."
-        press_enter_to_continue
-        return 1
-    fi
-    log_action "Detected main interface: $INTERFACE"
-
-
-    # ------------ Setup VXLAN Interface --------------
-    echo "[+] Creating VXLAN interface ${VXLAN_IF}..."
-    log_action "Creating VXLAN interface."
-    # Ensure the interface is not already present before adding
-    ip link del $VXLAN_IF 2>/dev/null
-    ip link add $VXLAN_IF type vxlan id $VNI local $(hostname -I | awk '{print $1}') remote $REMOTE_IP dev $INTERFACE dstport $DSTPORT nolearning
-    
-    echo "[+] Assigning IP $MY_VXLAN_IP to $VXLAN_IF"
-    ip addr add $MY_VXLAN_IP dev $VXLAN_IF
-    ip link set $VXLAN_IF up
-    log_action "VXLAN interface configured and brought up."
-
-    # ------------ Setup IPTables Rules --------------
-    echo "[+] Adding iptables rules for VXLAN tunnel on port ${DSTPORT}..."
-    log_action "Adding iptables rules."
-    # Backup existing iptables rules before adding new ones
-    sudo iptables-save > /etc/iptables/rules.v4.bak # Backup current rules
-    if command -v ip6tables-save >/dev/null 2>&1; then
-        sudo ip6tables-save > /etc/iptables/rules.v6.bak
-    fi
-
-    # Accept UDP traffic on the VXLAN port
-    iptables -I INPUT 1 -p udp --dport $DSTPORT -j ACCEPT
-    # Accept traffic from the remote VXLAN public IP
-    iptables -I INPUT 1 -s $REMOTE_IP -j ACCEPT
-    # Accept traffic from the remote VXLAN internal IP
-    # This assumes the remote VXLAN internal IP is the other part of 30.0.0.0/24
-    if [[ "$role_choice" == "1" ]]; then # If Iran server
-        iptables -I INPUT 1 -s ${KHAREJ_VXLAN_IP%/*} -j ACCEPT # Accept from Kharej VXLAN IP (e.g., 30.0.0.2)
-        # Enable IP forwarding
-        sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
-        log_action "Enabled IPv4 forwarding on Iran server."
-    elif [[ "$role_choice" == "2" ]]; then # If Kharej server
-        iptables -I INPUT 1 -s ${IRAN_VXLAN_IP%/*} -j ACCEPT # Accept from Iran VXLAN IP (e.g., 30.0.0.1)
-        # Enable IP forwarding and NAT for internet access
-        sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1
-        # Add NAT (Masquerade) rule for traffic coming from VXLAN internal network to go to the internet
-        iptables -t nat -A POSTROUTING -o "$INTERFACE" -j MASQUERADE
-        log_action "Enabled IPv4 forwarding and NAT on Kharej server."
-    fi
-
-    # Save iptables rules persistently
-    if command -v iptables-save >/dev/null 2>&1 && command -v netfilter-persistent >/dev/null 2>&1; then
-        sudo netfilter-persistent save > /dev/null 2>&1
-        log_action "✅ iptables rules saved persistently."
-    else
-        log_action "⚠️ Warning: iptables-persistent is not installed. Rules might not survive reboot. Install 'iptables-persistent'."
-        echo "Warning: 'iptables-persistent' is not installed. IPtables rules might not survive reboot. Consider installing it."
-    fi
-
-    # ---------------- CREATE SYSTEMD SERVICE ----------------
-    echo "[+] Creating systemd service for VXLAN tunnel persistence..."
-    log_action "Creating systemd service for VXLAN."
-
-    cat <<EOF > /usr/local/bin/vxlan_bridge.sh
-#!/bin/bash
-# Script to bring up VXLAN interface persistently
-ip link add $VXLAN_IF type vxlan id $VNI local \$(hostname -I | awk '{print \$1}') remote $REMOTE_IP dev $INTERFACE dstport $DSTPORT nolearning
-ip addr add $MY_VXLAN_IP dev $VXLAN_IF
-ip link set $VXLAN_IF up
-
-# Add iptables rules on boot (in case iptables-persistent is not fully relied upon)
-iptables -I INPUT 1 -p udp --dport $DSTPORT -j ACCEPT
-iptables -I INPUT 1 -s $REMOTE_IP -j ACCEPT
-if [[ "$role_choice" == "1" ]]; then # If Iran server
-    iptables -I INPUT 1 -s ${KHAREJ_VXLAN_IP%/*} -j ACCEPT
-elif [[ "$role_choice" == "2" ]]; then # If Kharej server
-    iptables -I INPUT 1 -s ${IRAN_VXLAN_IP%/*} -j ACCEPT
-    iptables -t nat -A POSTROUTING -o "$INTERFACE" -j MASQUERADE
+# --- Start the script ---
+# Check if the script is being run for the first time or if the persistent command needs setup
+# The $0 variable contains the path/name used to invoke the script.
+# If it's not the already symlinked persistent path, set up.
+if [[ "$(readlink -f "$0")" != "$SCRIPT_PATH" ]]; then
+    setup_persistent_command
 fi
-sysctl -w net.ipv4.ip_forward=1 > /dev/null 2>&1 # Ensure forwarding is enabled
-
-# Persistent keepalive: ping remote every 30s in background to keep tunnel alive
-( while true; do ping -c 1 $REMOTE_IP >/dev/null 2>&1; sleep 30; done ) &
-EOF
-
-    chmod +x /usr/local/bin/vxlan_bridge.sh
-
-    cat <<EOF > /etc/systemd/system/vxlan-tunnel.service
-[Unit]
-Description=ExitTunnel VXLAN Tunnel Interface
-After=network.target network-online.target
-
-[Service]
-ExecStart=/usr/local/bin/vxlan_bridge.sh
-Type=oneshot
-RemainAfterExit=yes
-# Ensure ping process is killed on service stop
-ExecStop=/bin/bash -c 'pkill -f "ping -c 1 $REMOTE_IP"' 
-ExecStop=/sbin/ip link del $VXLAN_IF 2>/dev/null || true # Ensure interface is cleaned up on stop
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    chmod 644 /etc/systemd/system/vxlan-tunnel.service
-    systemctl daemon-reexec
-    systemctl daemon-reload
-    systemctl enable vxlan-tunnel.service
-    systemctl start vxlan-tunnel.service
-    log_action "✅ VXLAN tunnel service enabled and started."
-
-    echo -e "\n${GREEN}[✓] VXLAN tunnel setup completed successfully.${NC}"
-
-    echo -e "\n${YELLOW}Next Steps:${NC}"
-    if [[ "$role_choice" == "1" ]]; then # Iran Server
-        echo -e " - On your Iran Server (IP: $(get_public_ipv4)): You can now configure X-UI/Sanayi."
-        echo -e " - Create Inbounds (e.g., VLESS/TCP) on public ports (e.g., 443, 80)."
-        echo -e " - For the Outbound of these Inbounds, configure them to connect to your Foreign Server's VXLAN internal IP: ${GREEN}${KHAREJ_VXLAN_IP%/*}${NC}"
-        echo -e " - Example for VLESS/TCP Outbound: Server IP: ${GREEN}${KHAREJ_VXLAN_IP%/*}${NC}, Port: (Any port that your Sanayi/X-UI connects to on foreign server, e.g., 443 or 80)"
-        echo -e " - Make sure to open your X-UI Inbound ports (e.g., 443, 80) in your Iran Server's firewall."
-        echo -e " - ${MAGENTA}HAProxy is configured to automatically redirect traffic from your public ports to the VXLAN tunnel.${NC}"
-        echo -e " If you chose to install HAProxy, ensure it's configured for the ports you intend to use."
-        echo -e " Traffic will come into public ports (e.g., 443) -> HAProxy -> VXLAN ${KHAREJ_VXLAN_IP%/*}:${PUBLIC_PORT} (via X-UI on Kharej)."
-    elif [[ "$role_choice" == "2" ]]; then # Kharej Server
-        echo -e " - On your Kharej Server (IP: $(get_public_ipv4)): You need to install Sanayi/X-UI here."
-        echo -e " - Create Inbounds (e.g., VLESS/TCP) listening on the VXLAN internal IP: ${GREEN}${KHAREJ_VXLAN_IP%/*}${NC}"
-        echo -e " - Example for VLESS/TCP Inbound: Listen IP: ${GREEN}${KHAREJ_VXLAN_IP%/*}${NC}, Port: (Any port e.g., 443 or 80)"
-        echo -e " - Ensure your firewall on Kharej server allows traffic from Iran's VXLAN internal IP (${IRAN_VXLAN_IP%/*}) to reach ${KHAREJ_VXLAN_IP%/*}:${PUBLIC_PORT}."
-        echo -e " - NAT (Masquerade) rules are automatically applied to allow internet access from VXLAN."
-    fi
-    echo -e "\n${MAGENTA}Remember to run this script on BOTH your Iran and Foreign servers!${NC}"
-    press_enter_to_continue
-}
-
-
-# ---------------- MAIN EXECUTION ----------------
-
-# Set up persistent command on first run
-setup_persistent_command
-
-while true; do
-    display_header
-    echo "Select an option:"
-    echo "1- Install new tunnel"
-    echo "2- Uninstall tunnel(s)"
-    echo "3- Install BBR"
-    echo "4- Install cronjob (for HAProxy/VXLAN restart)"
-    echo "5- Exit" # Added Exit option for clarity
-    read -p "Enter your choice [1-5]: " main_action
-    case $main_action in
-        1)
-            install_new_tunnel_core # Renamed to encapsulate tunnel logic
-            ;;
-        2)
-            uninstall_all_vxlan
-            ;;
-        3)
-            install_bbr
-            ;;
-        4)
-            install_cronjob
-            ;;
-        5)
-            log_action "Exiting script."
-            echo "Exiting ExitTunnel Manager. Goodbye!"
-            exit 0
-            ;;
-        *)
-            echo "[x] Invalid option. Try again."
-            sleep 1
-            ;;
-    esac
-done
+main_menu
 
