@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ====================================================
-# QDTunnel Enterprise - High Performance TCP Tunnel
-# Optimized for High Latency & Packet Loss Networks
+# QDTunnel Enterprise V2 - Optimized & Fixed
+# Fixed & Enhanced by Gemini Enterprise
 # ====================================================
 
 # --- Colors ---
@@ -42,7 +42,7 @@ install_deps() {
     if [[ ! -f "$TUNNELS_JSON" ]]; then echo "[]" > "$TUNNELS_JSON"; fi
 }
 
-# --- 2. NETWORK OPTIMIZATION (The "Pro" Part) ---
+# --- 2. NETWORK OPTIMIZATION ---
 optimize_kernel() {
     echo -e "${CYAN}[*] Applying Network Optimizations (BBR + TCP Tuning)...${NC}"
     
@@ -59,11 +59,14 @@ net.ipv4.tcp_keepalive_time = 30
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 3
 net.ipv4.ip_forward = 1
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
 EOF
     sysctl --system >> $LOG_FILE 2>&1
 
-    # 3. FIX MTU/MSS (Crucial for Download Speed)
-    # This prevents packets from being dropped by filtering equipment
+    # 3. FIX MTU/MSS
     iptables -t mangle -F FORWARD 2>/dev/null
     iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1300
     iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1300
@@ -77,6 +80,13 @@ create_tunnel_service() {
     local CMD=$2
     local SERVICE_PATH="$SERVICE_DIR/qdtunnel-${NAME}.service"
 
+    # Clean up old service if exists
+    if [[ -f "$SERVICE_PATH" ]]; then
+        systemctl stop "qdtunnel-${NAME}"
+        systemctl disable "qdtunnel-${NAME}"
+        rm "$SERVICE_PATH"
+    fi
+
     cat > "$SERVICE_PATH" <<EOF
 [Unit]
 Description=QDTunnel Service - ${NAME}
@@ -85,7 +95,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/bash -c '${CMD}'
+ExecStart=/bin/bash -c '${CMD}'
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
@@ -104,10 +114,25 @@ EOF
 add_tunnel() {
     clear
     echo -e "${BLUE}=== Create New Tunnel ===${NC}"
-    echo "1) IRAN Server (Bridge)"
+    echo "1) TCP (V2Ray, HTTP, Standard)"
+    echo "2) UDP (WireGuard, Hysteria, Games)"
+    read -p "Select Protocol [1-2]: " PROTO_OPT
+
+    local PROTO_TYPE="TCP"
+    local SOCAT_PROTO="TCP"
+    
+    if [[ "$PROTO_OPT" == "2" ]]; then
+        PROTO_TYPE="UDP"
+        SOCAT_PROTO="UDP"
+    fi
+
+    echo -e "\n${YELLOW}Selected Protocol: $PROTO_TYPE${NC}"
+
+    echo "--------------------------------"
+    echo "1) IRAN Server (Bridge/Relay)"
     echo "2) KHAREJ Server (Destination)"
     read -p "Select Role [1-2]: " ROLE
-
+    
     read -p "Enter Tunnel Name (e.g. v2ray_tun): " TNAME
     if [[ -z "$TNAME" ]]; then echo -e "${RED}Name required.${NC}"; sleep 1; return; fi
     
@@ -116,6 +141,8 @@ add_tunnel() {
         echo -e "${RED}Tunnel name exists!${NC}"; sleep 2; return;
     fi
 
+    local LPORT RHOST RPORT CMD
+
     if [[ "$ROLE" == "1" ]]; then
         # IRAN Logic
         echo -e "\n${YELLOW}--- IRAN CONFIG ---${NC}"
@@ -123,29 +150,38 @@ add_tunnel() {
         read -p "Kharej IP Address: " RHOST
         read -p "Kharej Port (Output): " RPORT
         
-        # PRO Command with TCP Optimization flags
-        CMD="socat TCP-LISTEN:${LPORT},reuseaddr,fork,keepalive,rcvbuf=65536,sndbuf=65536 TCP:${RHOST}:${RPORT},keepalive,rcvbuf=65536,sndbuf=65536"
-        
+        # PRO Command with Optimization flags
+        if [[ "$PROTO_TYPE" == "TCP" ]]; then
+             CMD="socat TCP-LISTEN:${LPORT},reuseaddr,fork,keepalive,rcvbuf=65536,sndbuf=65536 TCP:${RHOST}:${RPORT},keepalive,rcvbuf=65536,sndbuf=65536"
+        else
+             CMD="socat UDP-LISTEN:${LPORT},reuseaddr,fork,rcvbuf=65536,sndbuf=65536 UDP:${RHOST}:${RPORT},rcvbuf=65536,sndbuf=65536"
+        fi
+
         create_tunnel_service "$TNAME" "$CMD"
         
-        # Save to DB
-        jq ". += [{\"name\": \"$TNAME\", \"role\": \"IRAN\", \"port\": \"$LPORT -> $RHOST:$RPORT\"}]" "$TUNNELS_JSON" > "$TUNNELS_JSON.tmp" && mv "$TUNNELS_JSON.tmp" "$TUNNELS_JSON"
-        echo -e "${GREEN}[✓] Iran tunnel started on port $LPORT${NC}"
+        # Save to DB (Using a temp file to avoid jq rewrite issues)
+        jq ". += [{\"name\": \"$TNAME\", \"role\": \"IRAN\", \"proto\": \"$PROTO_TYPE\", \"port\": \"$LPORT -> $RHOST:$RPORT\"}]" "$TUNNELS_JSON" > "$TUNNELS_JSON.tmp" && mv "$TUNNELS_JSON.tmp" "$TUNNELS_JSON"
+        echo -e "${GREEN}[✓] Iran tunnel ($PROTO_TYPE) started on port $LPORT${NC}"
 
     elif [[ "$ROLE" == "2" ]]; then
         # KHAREJ Logic
         echo -e "\n${YELLOW}--- KHAREJ CONFIG ---${NC}"
         read -p "Listen Port (Input from Iran): " LPORT
         read -p "Target IP (Usually 127.0.0.1): " RHOST
-        read -p "Target Port (V2Ray Port): " RPORT
+        read -p "Target Port (Config Port): " RPORT
 
-        CMD="socat TCP-LISTEN:${LPORT},reuseaddr,fork,keepalive,rcvbuf=65536,sndbuf=65536 TCP:${RHOST}:${RPORT},keepalive,rcvbuf=65536,sndbuf=65536"
+        if [[ "$PROTO_TYPE" == "TCP" ]]; then
+             CMD="socat TCP-LISTEN:${LPORT},reuseaddr,fork,keepalive,rcvbuf=65536,sndbuf=65536 TCP:${RHOST}:${RPORT},keepalive,rcvbuf=65536,sndbuf=65536"
+        else
+             CMD="socat UDP-LISTEN:${LPORT},reuseaddr,fork,rcvbuf=65536,sndbuf=65536 UDP:${RHOST}:${RPORT},rcvbuf=65536,sndbuf=65536"
+        fi
         
         create_tunnel_service "$TNAME" "$CMD"
         
-        jq ". += [{\"name\": \"$TNAME\", \"role\": \"KHAREJ\", \"port\": \"$LPORT -> $RHOST:$RPORT\"}]" "$TUNNELS_JSON" > "$TUNNELS_JSON.tmp" && mv "$TUNNELS_JSON.tmp" "$TUNNELS_JSON"
-        echo -e "${GREEN}[✓] Kharej tunnel listening on port $LPORT${NC}"
+        jq ". += [{\"name\": \"$TNAME\", \"role\": \"KHAREJ\", \"proto\": \"$PROTO_TYPE\", \"port\": \"$LPORT -> $RHOST:$RPORT\"}]" "$TUNNELS_JSON" > "$TUNNELS_JSON.tmp" && mv "$TUNNELS_JSON.tmp" "$TUNNELS_JSON"
+        echo -e "${GREEN}[✓] Kharej tunnel ($PROTO_TYPE) listening on port $LPORT${NC}"
     fi
+
     sleep 2
 }
 
@@ -155,16 +191,16 @@ list_tunnels() {
     if [[ ! -s "$TUNNELS_JSON" || "$(cat $TUNNELS_JSON)" == "[]" ]]; then
         echo "No tunnels found."
     else
-        printf "%-15s %-10s %-30s %-10s\n" "NAME" "ROLE" "ROUTING" "STATUS"
-        echo "----------------------------------------------------------------"
-        jq -r '.[] | "\(.name) \(.role) \(.port)"' "$TUNNELS_JSON" | while read -r name role port; do
+        printf "%-15s %-5s %-8s %-25s %-10s\n" "NAME" "PROTO" "ROLE" "ROUTING" "STATUS"
+        echo "-----------------------------------------------------------------------"
+        jq -r '.[] | "\(.name) \(.proto) \(.role) \(.port)"' "$TUNNELS_JSON" | while read -r name proto role port; do
             STATUS=$(systemctl is-active "qdtunnel-$name")
             if [[ "$STATUS" == "active" ]]; then
                 COLOR=$GREEN
             else
                 COLOR=$RED
             fi
-            printf "%-15s %-10s %-30s ${COLOR}%-10s${NC}\n" "$name" "$role" "$port" "$STATUS"
+            printf "%-15s %-5s %-8s %-25s ${COLOR}%-10s${NC}\n" "$name" "${proto:-TCP}" "$role" "$port" "$STATUS"
         done
     fi
     echo ""
@@ -206,16 +242,15 @@ install_deps
 while true; do
     clear
     echo -e "${CYAN}===================================${NC}"
-    echo -e "${CYAN}   QDTunnel Enterprise Manager     ${NC}"
+    echo -e "${CYAN}   QDTunnel Enterprise Manager V2  ${NC}"
     echo -e "${CYAN}===================================${NC}"
-    echo "1. Create New Tunnel"
+    echo "1. Create New Tunnel (TCP/UDP)"
     echo "2. List & Check Status"
     echo "3. Remove Tunnel"
-    echo -e "${YELLOW}4. FORCE FIX NETWORK (Run this for Download Fix)${NC}"
+    echo -e "${YELLOW}4. FORCE FIX NETWORK & OPTIMIZE${NC}"
     echo "0. Exit"
     echo "-----------------------------------"
     read -p "Select Option: " OPT
-
     case $OPT in
         1) add_tunnel ;;
         2) list_tunnels ;;
@@ -225,4 +260,3 @@ while true; do
         *) echo "Invalid option" ;;
     esac
 done
-
