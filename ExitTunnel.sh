@@ -32,12 +32,23 @@ log() { echo "[$(date '+%F %T')] $*"; }
 
 # ---------------- helpers ----------------
 safe_read() {
-  # safe read: allow empty (user presses Enter) and preserve spaces
+  # safe read: prefer /dev/tty (real terminal) so interactive prompts work
+  # even when script is run via "curl | bash" (stdin was consumed).
   local _varname="$1"; shift
   local _prompt="$*"
-  local _val
-  printf "%s" "$_prompt"
-  IFS= read -r _val || true
+  local _val=""
+  local _tty="/dev/tty"
+
+  # If /dev/tty exists and is readable, read from it.
+  if [[ -e "$_tty" && -r "$_tty" ]]; then
+    printf "%s" "$_prompt" > "$_tty"
+    IFS= read -r _val < "$_tty" || true
+  else
+    # fallback to standard stdin
+    printf "%s" "$_prompt"
+    IFS= read -r _val || true
+  fi
+
   # strip trailing CR if any
   _val="${_val%%$'\r'}"
   printf -v "$_varname" "%s" "$_val"
@@ -270,7 +281,7 @@ remove_tunnel_flow() {
   if [[ -z "$NAME" ]]; then echo "Cancelled."; return; fi
   # stop and disable
   systemctl stop "exittunnel-${NAME}.service" 2>/dev/null || true
-  systemctl disable "exittunnel-${NAME}.service" 2>/dev/null || true
+  systemctl.disable="exittunnel-${NAME}.service" 2>/dev/null || true
   rm -f "/etc/systemd/system/exittunnel-${NAME}.service" "$SCRIPTS_DIR/run-${NAME}.sh"
   systemctl daemon-reload || true
   remove_tunnel_meta "$NAME"
