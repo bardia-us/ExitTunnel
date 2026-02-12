@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ====================================================
-# QDTunnel Enterprise V2 - Optimized & Fixed
-# Fixed & Enhanced by Gemini Enterprise
+#  QUIC-GOST TUNNEL - NEXT GEN 🚀
+#  Simple, Fast, Encrypted Tunnel using GOST v2
 # ====================================================
 
 # --- Colors ---
@@ -10,253 +10,154 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-CYAN='\033[0;36m'
 NC='\033[0m'
 
-# --- Configuration ---
-CONF_DIR="/etc/qdtunnel"
-TUNNELS_JSON="$CONF_DIR/tunnels.json"
+# --- Config ---
+GOST_PATH="/usr/local/bin/gost"
 SERVICE_DIR="/etc/systemd/system"
-LOG_FILE="/var/log/qdtunnel_install.log"
 
-# --- 1. System Integrity Check ---
+# --- Functions ---
+
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}[Error] Please run as root (sudo).${NC}"
+        echo -e "${RED}Please run as root!${NC}"
         exit 1
     fi
 }
 
-install_deps() {
-    echo -e "${BLUE}[*] Checking system dependencies...${NC}"
-    local PKGS=""
-    if ! command -v socat &> /dev/null; then PKGS="$PKGS socat"; fi
-    if ! command -v jq &> /dev/null; then PKGS="$PKGS jq"; fi
-    if ! command -v iptables &> /dev/null; then PKGS="$PKGS iptables"; fi
-    
-    if [[ -n "$PKGS" ]]; then
-        echo -e "${YELLOW}[*] Installing missing packages:$PKGS ...${NC}"
-        apt-get update -qq && apt-get install -y $PKGS -qq >> $LOG_FILE 2>&1
+install_gost() {
+    if command -v gost &> /dev/null; then
+        echo -e "${GREEN}GOST is already installed.${NC}"
+        return
     fi
-    mkdir -p "$CONF_DIR"
-    if [[ ! -f "$TUNNELS_JSON" ]]; then echo "[]" > "$TUNNELS_JSON"; fi
+
+    echo -e "${BLUE}[*] Detecting Architecture...${NC}"
+    ARCH=$(uname -m)
+    if [[ "$ARCH" == "x86_64" ]]; then
+        URL="https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz"
+    elif [[ "$ARCH" == "aarch64" ]]; then
+        URL="https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-arm64-2.11.5.gz"
+    else
+        echo -e "${RED}Architecture $ARCH not supported automatically.${NC}"
+        return
+    fi
+
+    echo -e "${YELLOW}[*] Downloading GOST (The Beast)...${NC}"
+    wget -q --show-progress "$URL" -O /tmp/gost.gz
+    gzip -d /tmp/gost.gz
+    mv /tmp/gost /usr/local/bin/
+    chmod +x /usr/local/bin/gost
+    echo -e "${GREEN}[✓] GOST Installed Successfully!${NC}"
 }
 
-# --- 2. NETWORK OPTIMIZATION ---
-optimize_kernel() {
-    echo -e "${CYAN}[*] Applying Network Optimizations (BBR + TCP Tuning)...${NC}"
+setup_kharej() {
+    echo -e "\n${YELLOW}--- KHAREJ SERVER SETUP (DESTINATION) ---${NC}"
+    echo "This server will receive traffic via QUIC and send it to your V2Ray/Config."
     
-    # 1. Enable BBR
-    if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
-        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-    fi
-
-    # 2. Optimize TCP Keepalive & Buffer
-    cat > /etc/sysctl.d/99-qdtunnel.conf <<EOF
-fs.file-max = 1000000
-net.ipv4.tcp_keepalive_time = 30
-net.ipv4.tcp_keepalive_intvl = 10
-net.ipv4.tcp_keepalive_probes = 3
-net.ipv4.ip_forward = 1
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-net.ipv4.tcp_rmem = 4096 87380 16777216
-net.ipv4.tcp_wmem = 4096 65536 16777216
-EOF
-    sysctl --system >> $LOG_FILE 2>&1
-
-    # 3. FIX MTU/MSS
-    iptables -t mangle -F FORWARD 2>/dev/null
-    iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1300
-    iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1300
+    read -p "Enter Tunnel Port (UDP port to listen on, e.g., 443 or 8443): " TUN_PORT
+    read -p "Enter Target Port (Where is V2Ray listening? e.g., 2053): " TARGET_PORT
     
-    echo -e "${GREEN}[✓] System Optimized! BBR ON | MSS Clamped to 1300${NC}"
-}
+    # Validation
+    if [[ -z "$TUN_PORT" || -z "$TARGET_PORT" ]]; then echo "${RED}Invalid inputs!${NC}"; return; fi
 
-# --- 3. Service Management ---
-create_tunnel_service() {
-    local NAME=$1
-    local CMD=$2
-    local SERVICE_PATH="$SERVICE_DIR/qdtunnel-${NAME}.service"
+    SERVICE_FILE="$SERVICE_DIR/gost-kharej.service"
+    
+    # Command: Listen on QUIC, Forward to Localhost TCP
+    CMD="$GOST_PATH -L=quic://:$TUN_PORT/127.0.0.1:$TARGET_PORT"
 
-    # Clean up old service if exists
-    if [[ -f "$SERVICE_PATH" ]]; then
-        systemctl stop "qdtunnel-${NAME}"
-        systemctl disable "qdtunnel-${NAME}"
-        rm "$SERVICE_PATH"
-    fi
-
-    cat > "$SERVICE_PATH" <<EOF
+    cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=QDTunnel Service - ${NAME}
-After=network-online.target
-Wants=network-online.target
+Description=GOST QUIC Tunnel (Kharej)
+After=network.target
 
 [Service]
-Type=simple
-ExecStart=/bin/bash -c '${CMD}'
+ExecStart=$CMD
 Restart=always
-RestartSec=3
+User=root
 LimitNOFILE=1048576
-StandardOutput=append:/var/log/qdtunnel.log
-StandardError=append:/var/log/qdtunnel.log
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable --now "qdtunnel-${NAME}"
+    systemctl enable --now gost-kharej
+    echo -e "${GREEN}[✓] Kharej Tunnel Started on UDP Port $TUN_PORT${NC}"
+    echo -e "${CYAN}Make sure port $TUN_PORT (UDP) is open in firewall!${NC}"
 }
 
-# --- 4. Logic Functions ---
-add_tunnel() {
-    clear
-    echo -e "${BLUE}=== Create New Tunnel ===${NC}"
-    echo "1) TCP (V2Ray, HTTP, Standard)"
-    echo "2) UDP (WireGuard, Hysteria, Games)"
-    read -p "Select Protocol [1-2]: " PROTO_OPT
-
-    local PROTO_TYPE="TCP"
-    local SOCAT_PROTO="TCP"
+setup_iran() {
+    echo -e "\n${YELLOW}--- IRAN SERVER SETUP (BRIDGE) ---${NC}"
+    echo "This server will accept user connections and fly them to Kharej via QUIC."
     
-    if [[ "$PROTO_OPT" == "2" ]]; then
-        PROTO_TYPE="UDP"
-        SOCAT_PROTO="UDP"
-    fi
-
-    echo -e "\n${YELLOW}Selected Protocol: $PROTO_TYPE${NC}"
-
-    echo "--------------------------------"
-    echo "1) IRAN Server (Bridge/Relay)"
-    echo "2) KHAREJ Server (Destination)"
-    read -p "Select Role [1-2]: " ROLE
+    read -p "Enter Local Port (User connects here, e.g., 8080): " USER_PORT
+    read -p "Enter Kharej IP Address: " KHAREJ_IP
+    read -p "Enter Kharej Tunnel Port (The QUIC port, e.g., 443): " TUN_PORT
     
-    read -p "Enter Tunnel Name (e.g. v2ray_tun): " TNAME
-    if [[ -z "$TNAME" ]]; then echo -e "${RED}Name required.${NC}"; sleep 1; return; fi
+    # Validation
+    if [[ -z "$USER_PORT" || -z "$KHAREJ_IP" || -z "$TUN_PORT" ]]; then echo "${RED}Invalid inputs!${NC}"; return; fi
+
+    SERVICE_FILE="$SERVICE_DIR/gost-iran.service"
     
-    # Check duplicate
-    if grep -q "\"name\": \"$TNAME\"" "$TUNNELS_JSON"; then
-        echo -e "${RED}Tunnel name exists!${NC}"; sleep 2; return;
-    fi
+    # Command: Listen TCP, Forward QUIC (Insecure to skip cert check)
+    CMD="$GOST_PATH -L=tcp://:$USER_PORT -F=quic://$KHAREJ_IP:$TUN_PORT?keepalive=true&noverify=true"
 
-    local LPORT RHOST RPORT CMD
+    cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=GOST QUIC Tunnel (Iran)
+After=network.target
 
-    if [[ "$ROLE" == "1" ]]; then
-        # IRAN Logic
-        echo -e "\n${YELLOW}--- IRAN CONFIG ---${NC}"
-        read -p "Local Port to Open (Input): " LPORT
-        read -p "Kharej IP Address: " RHOST
-        read -p "Kharej Port (Output): " RPORT
-        
-        # PRO Command with Optimization flags
-        if [[ "$PROTO_TYPE" == "TCP" ]]; then
-             CMD="socat TCP-LISTEN:${LPORT},reuseaddr,fork,keepalive,rcvbuf=65536,sndbuf=65536 TCP:${RHOST}:${RPORT},keepalive,rcvbuf=65536,sndbuf=65536"
-        else
-             CMD="socat UDP-LISTEN:${LPORT},reuseaddr,fork,rcvbuf=65536,sndbuf=65536 UDP:${RHOST}:${RPORT},rcvbuf=65536,sndbuf=65536"
-        fi
+[Service]
+ExecStart=$CMD
+Restart=always
+User=root
+LimitNOFILE=1048576
 
-        create_tunnel_service "$TNAME" "$CMD"
-        
-        # Save to DB (Using a temp file to avoid jq rewrite issues)
-        jq ". += [{\"name\": \"$TNAME\", \"role\": \"IRAN\", \"proto\": \"$PROTO_TYPE\", \"port\": \"$LPORT -> $RHOST:$RPORT\"}]" "$TUNNELS_JSON" > "$TUNNELS_JSON.tmp" && mv "$TUNNELS_JSON.tmp" "$TUNNELS_JSON"
-        echo -e "${GREEN}[✓] Iran tunnel ($PROTO_TYPE) started on port $LPORT${NC}"
+[Install]
+WantedBy=multi-user.target
+EOF
 
-    elif [[ "$ROLE" == "2" ]]; then
-        # KHAREJ Logic
-        echo -e "\n${YELLOW}--- KHAREJ CONFIG ---${NC}"
-        read -p "Listen Port (Input from Iran): " LPORT
-        read -p "Target IP (Usually 127.0.0.1): " RHOST
-        read -p "Target Port (Config Port): " RPORT
-
-        if [[ "$PROTO_TYPE" == "TCP" ]]; then
-             CMD="socat TCP-LISTEN:${LPORT},reuseaddr,fork,keepalive,rcvbuf=65536,sndbuf=65536 TCP:${RHOST}:${RPORT},keepalive,rcvbuf=65536,sndbuf=65536"
-        else
-             CMD="socat UDP-LISTEN:${LPORT},reuseaddr,fork,rcvbuf=65536,sndbuf=65536 UDP:${RHOST}:${RPORT},rcvbuf=65536,sndbuf=65536"
-        fi
-        
-        create_tunnel_service "$TNAME" "$CMD"
-        
-        jq ". += [{\"name\": \"$TNAME\", \"role\": \"KHAREJ\", \"proto\": \"$PROTO_TYPE\", \"port\": \"$LPORT -> $RHOST:$RPORT\"}]" "$TUNNELS_JSON" > "$TUNNELS_JSON.tmp" && mv "$TUNNELS_JSON.tmp" "$TUNNELS_JSON"
-        echo -e "${GREEN}[✓] Kharej tunnel ($PROTO_TYPE) listening on port $LPORT${NC}"
-    fi
-
-    sleep 2
-}
-
-list_tunnels() {
-    clear
-    echo -e "${BLUE}=== Active Tunnels ===${NC}"
-    if [[ ! -s "$TUNNELS_JSON" || "$(cat $TUNNELS_JSON)" == "[]" ]]; then
-        echo "No tunnels found."
-    else
-        printf "%-15s %-5s %-8s %-25s %-10s\n" "NAME" "PROTO" "ROLE" "ROUTING" "STATUS"
-        echo "-----------------------------------------------------------------------"
-        jq -r '.[] | "\(.name) \(.proto) \(.role) \(.port)"' "$TUNNELS_JSON" | while read -r name proto role port; do
-            STATUS=$(systemctl is-active "qdtunnel-$name")
-            if [[ "$STATUS" == "active" ]]; then
-                COLOR=$GREEN
-            else
-                COLOR=$RED
-            fi
-            printf "%-15s %-5s %-8s %-25s ${COLOR}%-10s${NC}\n" "$name" "${proto:-TCP}" "$role" "$port" "$STATUS"
-        done
-    fi
-    echo ""
-    read -p "Press Enter..."
+    systemctl daemon-reload
+    systemctl enable --now gost-iran
+    echo -e "${GREEN}[✓] Iran Tunnel Started on Port $USER_PORT${NC}"
+    echo -e "${BLUE}Users should connect to THIS server IP on port $USER_PORT${NC}"
 }
 
 remove_tunnel() {
-    clear
-    echo -e "${BLUE}=== Remove Tunnel ===${NC}"
-    jq -r '.[] | .name' "$TUNNELS_JSON"
-    echo ""
-    read -p "Enter name to delete: " TNAME
-    if [[ -z "$TNAME" ]]; then return; fi
-
-    systemctl stop "qdtunnel-$TNAME" 2>/dev/null
-    systemctl disable "qdtunnel-$TNAME" 2>/dev/null
-    rm "$SERVICE_DIR/qdtunnel-$TNAME.service" 2>/dev/null
-    systemctl daemon-reload
+    echo -e "${RED}[!] Stopping and Removing Services...${NC}"
+    systemctl stop gost-kharej 2>/dev/null
+    systemctl disable gost-kharej 2>/dev/null
+    rm "$SERVICE_DIR/gost-kharej.service" 2>/dev/null
     
-    jq "map(select(.name != \"$TNAME\"))" "$TUNNELS_JSON" > "$TUNNELS_JSON.tmp" && mv "$TUNNELS_JSON.tmp" "$TUNNELS_JSON"
-    echo -e "${GREEN}[✓] Tunnel $TNAME removed.${NC}"
-    sleep 1
+    systemctl stop gost-iran 2>/dev/null
+    systemctl disable gost-iran 2>/dev/null
+    rm "$SERVICE_DIR/gost-iran.service" 2>/dev/null
+    
+    systemctl daemon-reload
+    echo -e "${GREEN}[✓] Cleaned up.${NC}"
 }
 
-fix_network_issues() {
-    optimize_kernel
-    echo -e "${YELLOW}[*] Restarting all tunnels to apply changes...${NC}"
-    jq -r '.[] | .name' "$TUNNELS_JSON" | while read -r name; do
-        systemctl restart "qdtunnel-$name"
-    done
-    echo -e "${GREEN}[✓] Network Fixed & Tunnels Restarted.${NC}"
-    read -p "Press Enter..."
-}
-
-# --- 5. Main Loop ---
+# --- Main Menu ---
 check_root
-install_deps
+install_gost
 
 while true; do
     clear
-    echo -e "${CYAN}===================================${NC}"
-    echo -e "${CYAN}   QDTunnel Enterprise Manager V2  ${NC}"
-    echo -e "${CYAN}===================================${NC}"
-    echo "1. Create New Tunnel (TCP/UDP)"
-    echo "2. List & Check Status"
+    echo -e "${CYAN}==============================${NC}"
+    echo -e "${CYAN}   QUIC TUNNEL MANAGER (GOST) ${NC}"
+    echo -e "${CYAN}==============================${NC}"
+    echo "1. Setup KHAREJ (Destination)"
+    echo "2. Setup IRAN (Bridge)"
     echo "3. Remove Tunnel"
-    echo -e "${YELLOW}4. FORCE FIX NETWORK & OPTIMIZE${NC}"
     echo "0. Exit"
-    echo "-----------------------------------"
-    read -p "Select Option: " OPT
+    echo "------------------------------"
+    read -p "Select: " OPT
+
     case $OPT in
-        1) add_tunnel ;;
-        2) list_tunnels ;;
-        3) remove_tunnel ;;
-        4) fix_network_issues ;;
+        1) setup_kharej; read -p "Press Enter..." ;;
+        2) setup_iran; read -p "Press Enter..." ;;
+        3) remove_tunnel; read -p "Press Enter..." ;;
         0) exit 0 ;;
-        *) echo "Invalid option" ;;
+        *) echo "Invalid" ;;
     esac
 done
