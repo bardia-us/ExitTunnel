@@ -1,426 +1,259 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
 
-# ExitTunnel Minimal — single-file installer & manager
-# - No apt upgrade; only installs socat and jq (if available)
-# - Interactive menu: Iran/Kharej, Add/Remove/List/Restart/Logs/Exit
-# - Per-tunnel systemd service and per-tunnel log file
-# - Live-tail logs option after creating or from menu
-#
-# Usage:
-#   sudo bash install.sh
-# After install you can also run: qdtunnel create|list|remove|restart|logs
+# ==========================================
+# QDTunnel Pro - Advanced Socat Manager
+# Optimized for Stability & Anti-Censorship
+# ==========================================
 
-# -------- paths --------
-BASE_DIR="/opt/exittunnel"
-SCRIPTS_DIR="$BASE_DIR/scripts"
-CONF_DIR="/etc/exittunnel"
-LOG_DIR="/var/log/exittunnel"
-INSTALL_LOG="$LOG_DIR/install.log"
+# --- Colors ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# --- Paths ---
+INSTALL_DIR="/usr/local/bin"
+SCRIPT_NAME="qdtunnel"
+SCRIPT_PATH="$INSTALL_DIR/$SCRIPT_NAME"
+CONF_DIR="/etc/qdtunnel"
+LOG_DIR="/var/log/qdtunnel"
 TUNNELS_JSON="$CONF_DIR/tunnels.json"
-QDT_BIN="/usr/local/bin/qdtunnel"
-SERVICE_DIR="/etc/systemd/system"
 
-# ensure dirs
-mkdir -p "$SCRIPTS_DIR" "$CONF_DIR" "$LOG_DIR"
-touch "$INSTALL_LOG"
-chmod 640 "$INSTALL_LOG"
+# --- Root Check ---
+if [[ $EUID -ne 0 ]]; then
+   echo -e "${RED}[!] This script must be run as root.${NC}"
+   exit 1
+fi
 
-# small logger
-log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; echo "[$(date '+%F %T')] $*" >> "$INSTALL_LOG"; }
-
-# safe interactive read from /dev/tty when available (works with curl|bash)
-safe_read() {
-  local varname="$1"; shift
-  local prompt="$*"
-  local val=""
-  if [[ -e /dev/tty && -r /dev/tty ]]; then
-    printf "%s" "$prompt" > /dev/tty
-    IFS= read -r val < /dev/tty || true
-  else
-    printf "%s" "$prompt"
-    IFS= read -r val || true
-  fi
-  val="${val%%$'\r'}"
-  printf -v "$varname" "%s" "$val"
+# --- Self-Installation (Fixing the "Disappearing" Bug) ---
+install_self() {
+    if [[ "$0" != "$SCRIPT_PATH" ]]; then
+        echo -e "${BLUE}[*] Installing QDTunnel to system...${NC}"
+        mkdir -p "$CONF_DIR" "$LOG_DIR"
+        cp "$0" "$SCRIPT_PATH"
+        chmod +x "$SCRIPT_PATH"
+        echo -e "${GREEN}[+] Installed successfully! Type 'qdtunnel' to run it anytime.${NC}"
+        echo -e "${YELLOW}[*] Relaunching from installed path...${NC}"
+        sleep 1
+        exec "$SCRIPT_PATH" "$@"
+        exit 0
+    fi
 }
 
-require_root() {
-  if [[ $EUID -ne 0 ]]; then
-    echo "Run as root (sudo)." >&2
-    exit 1
-  fi
+# --- Dependencies ---
+check_dependencies() {
+    local MISSING_PACKAGES=()
+    
+    if ! command -v socat &> /dev/null; then MISSING_PACKAGES+=("socat"); fi
+    if ! command -v jq &> /dev/null; then MISSING_PACKAGES+=("jq"); fi
+    if ! command -v curl &> /dev/null; then MISSING_PACKAGES+=("curl"); fi
+
+    if [ ${#MISSING_PACKAGES[@]} -ne 0 ]; then
+        echo -e "${YELLOW}[*] Installing missing dependencies: ${MISSING_PACKAGES[*]}...${NC}"
+        apt-get update -qq
+        apt-get install -y -qq "${MISSING_PACKAGES[@]}"
+    fi
 }
 
-# install minimal packages (no upgrade). Log output to install log but keep console short.
-install_deps() {
-  log "Installing dependencies (socat jq) — no apt upgrade."
-  # try install and capture output in install log
-  if apt-get update -y >>"$INSTALL_LOG" 2>&1 && apt-get install -y socat jq >>"$INSTALL_LOG" 2>&1; then
-    log "Packages installed (socat jq)."
-    return 0
-  fi
-  log "apt install failed or partial — you can provide a mirror or install manually."
-  safe_read MIRROR "If you have an apt mirror URL to try, enter it (or Enter to skip): "
-  if [[ -n "$MIRROR" ]]; then
-    cp -n /etc/apt/sources.list /etc/apt/sources.list.exitt_backup || true
-    echo "deb $MIRROR $(lsb_release -cs) main" >/tmp/exitt_sources.list
-    mv /tmp/exitt_sources.list /etc/apt/sources.list
-    apt-get update -y >>"$INSTALL_LOG" 2>&1 || true
-    apt-get install -y socat jq >>"$INSTALL_LOG" 2>&1 || true
-    log "Tried mirror. Check $INSTALL_LOG for details."
-    cp -f /etc/apt/sources.list.exitt_backup /etc/apt/sources.list || true
-  fi
+# --- Optimization (BBR & Sysctl) ---
+optimize_network() {
+    if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
+        echo -e "${BLUE}[*] Enabling BBR for better speed...${NC}"
+        echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
+        echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
+        sysctl -p &> /dev/null
+    fi
 }
 
-# JSON store helpers
-init_store() {
-  if [[ ! -f "$TUNNELS_JSON" || ! -s "$TUNNELS_JSON" ]]; then
-    echo "[]" > "$TUNNELS_JSON"
-    chmod 640 "$TUNNELS_JSON"
-  fi
+# --- JSON Database Helpers ---
+init_db() {
+    if [[ ! -f "$TUNNELS_JSON" ]]; then
+        echo "[]" > "$TUNNELS_JSON"
+    fi
 }
 
-add_tunnel_meta() {
-  local meta="$1"
-  if command -v jq >/dev/null 2>&1; then
-    tmp=$(mktemp)
-    jq ". += [ $meta ]" "$TUNNELS_JSON" > "$tmp" && mv "$tmp" "$TUNNELS_JSON"
-  else
-    # safe python fallback
-    python3 - <<PY >>"$INSTALL_LOG" 2>&1 || true
-import json
-f="$TUNNELS_JSON"
-try:
-  a=json.load(open(f))
-except:
-  a=[]
-a.append($meta)
-open(f,"w").write(json.dumps(a))
-PY
-  fi
+save_tunnel() {
+    # $1 = json object
+    jq ". += [$1]" "$TUNNELS_JSON" > "${TUNNELS_JSON}.tmp" && mv "${TUNNELS_JSON}.tmp" "$TUNNELS_JSON"
 }
 
-remove_tunnel_meta() {
-  local name="$1"
-  if command -v jq >/dev/null 2>&1; then
-    tmp=$(mktemp)
-    jq --arg n "$name" 'map(select(.name != $n))' "$TUNNELS_JSON" > "$tmp" && mv "$tmp" "$TUNNELS_JSON"
-  else
-    grep -v "\"name\": \"$name\"" "$TUNNELS_JSON" > /tmp/tun.tmp || true
-    mv /tmp/tun.tmp "$TUNNELS_JSON" || true
-  fi
+remove_tunnel_db() {
+    # $1 = name
+    jq "map(select(.name != \"$1\"))" "$TUNNELS_JSON" > "${TUNNELS_JSON}.tmp" && mv "${TUNNELS_JSON}.tmp" "$TUNNELS_JSON"
 }
 
-list_tunnels_meta() {
-  if command -v jq >/dev/null 2>&1; then
-    jq -r '.[] | "• " + .name + " | role=" + .role + " | local=" + (.local_port // "-") + " | remote=" + (.remote_host // "-") + ":" + (.remote_port // "-")' "$TUNNELS_JSON" || echo "(empty)"
-  else
-    cat "$TUNNELS_JSON"
-  fi
-}
+# --- Service Management ---
+create_service() {
+    local NAME=$1
+    local CMD=$2
+    local SERVICE_FILE="/etc/systemd/system/qdtunnel-${NAME}.service"
 
-# write run script with its own log (so user can tail the file)
-write_run_script() {
-  local name="$1"; local content="$2"
-  local runpath="$SCRIPTS_DIR/run-$name.sh"
-  cat > "$runpath" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-SH
-  # add log redirect at top of run script
-  local runlog="$LOG_DIR/$name.log"
-  printf "exec >>\"%s\" 2>&1\n" "$runlog" >> "$runpath"
-  printf "%s\n" "$content" >> "$runpath"
-  chmod +x "$runpath"
-  echo "$runpath"
-}
-
-create_systemd_unit_and_start() {
-  local name="$1"; local runpath="$2"
-  local unit="/etc/systemd/system/exittunnel-${name}.service"
-  cat > "$unit" <<EOF
+    cat > "$SERVICE_FILE" <<EOF
 [Unit]
-Description=ExitTunnel - ${name}
-After=network.target
+Description=QDTunnel - ${NAME}
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/bin/bash ${runpath}
+ExecStart=/bin/bash -c '${CMD}'
 Restart=always
 RestartSec=3
-LimitNOFILE=65536
+StartLimitIntervalSec=0
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable --now "exittunnel-${name}.service"
-  sleep 0.4
+
+    systemctl daemon-reload
+    systemctl enable --now "qdtunnel-${NAME}"
 }
 
-# create client (Iran side) or server (Kharej side)
-add_tunnel_flow() {
-  clear
-  echo "=== Add Tunnel ==="
-  echo "1) Iran (client) — listens locally, forwards to outside"
-  echo "2) Kharej (server) — listens on outside server, forwards locally"
-  safe_read ROLE "Select role (1/2, Enter to cancel): "
-  if [[ -z "$ROLE" ]]; then echo "Cancelled."; return; fi
-  if [[ "$ROLE" != "1" && "$ROLE" != "2" ]]; then echo "Invalid."; return; fi
+# --- Menu Functions ---
+add_tunnel() {
+    clear
+    echo -e "${CYAN}=== Add New Tunnel ===${NC}"
+    echo "1) IRAN Mode (Listen Local -> Forward to Kharej)"
+    echo "2) KHAREJ Mode (Listen Public -> Forward to internal/other)"
+    read -p "Select Role [1-2]: " ROLE
 
-  safe_read NAME "Tunnel name (no spaces): "
-  if [[ -z "$NAME" ]]; then echo "Name required."; return; fi
-
-  if [[ "$ROLE" == "1" ]]; then
-    # client (Iran)
-    safe_read LOCAL_PORT "Local listen port on IRAN (e.g. 1080 or 443): "
-    safe_read REMOTE_HOST "Outside server IP/host (e.g. 87.248.x.x): "
-    safe_read REMOTE_PORT "Outside server port (e.g. 443): "
-    safe_read WANT_HDR "Inject HTTP-like header to remote? (y/N): "
-    if [[ "$WANT_HDR" =~ ^[Yy] ]]; then
-      safe_read HDR_HOST "Header Host (e.g. cdn.microsoft.com): "
-      safe_read HDR_PATH "Header Path (e.g. /api/v1/update) [default /]: "
-      HDR_PATH=${HDR_PATH:-/}
-      HDR_STR=$(printf 'printf "GET %s HTTP/1.1\\r\\nHost: %s\\r\\nUser-Agent: Mozilla/5.0\\r\\nConnection: keep-alive\\r\\n\\r\\n"' "$HDR_PATH" "$HDR_HOST")
-      # run content: for each conn, send header then stream
-      read -r -d '' RUN <<'RUN_EOF' || true
-LOCAL_PORT='__LOCAL__'
-REMOTE_HOST='__REMOTE__'
-REMOTE_PORT='__RPORT__'
-# socat: for each incoming, run a tiny shell that prints header then streams
-exec socat TCP-LISTEN:${LOCAL_PORT},reuseaddr,fork SYSTEM:"bash -c '$HDR_CMD; cat' | socat - TCP:${REMOTE_HOST}:${REMOTE_PORT}"
-RUN_EOF
-      RUN="${RUN//__LOCAL__/$LOCAL_PORT}"
-      RUN="${RUN//__REMOTE__/$REMOTE_HOST}"
-      RUN="${RUN//__RPORT__/$REMOTE_PORT}"
-      # substitute HDR_CMD safely (unquote later)
-      RUN="${RUN//\$HDR_CMD/$HDR_STR}"
-    else
-      # simple forward
-      read -r -d '' RUN <<'RUN_EOF' || true
-LOCAL_PORT='__LOCAL__'
-REMOTE_HOST='__REMOTE__'
-REMOTE_PORT='__RPORT__'
-exec socat TCP-LISTEN:${LOCAL_PORT},reuseaddr,fork TCP:${REMOTE_HOST}:${REMOTE_PORT}
-RUN_EOF
-      RUN="${RUN//__LOCAL__/$LOCAL_PORT}"
-      RUN="${RUN//__REMOTE__/$REMOTE_HOST}"
-      RUN="${RUN//__RPORT__/$REMOTE_PORT}"
+    read -p "Tunnel Name (English, no spaces): " TNAME
+    if [[ -z "$TNAME" ]]; then echo -e "${RED}Name required!${NC}"; sleep 1; return; fi
+    
+    # Check duplicate
+    if grep -q "\"name\": \"$TNAME\"" "$TUNNELS_JSON"; then
+        echo -e "${RED}Tunnel with this name already exists!${NC}"; sleep 2; return;
     fi
 
-    RUNPATH=$(write_run_script "$NAME" "$RUN")
-    create_systemd_unit_and_start "$NAME" "$RUNPATH"
+    if [[ "$ROLE" == "1" ]]; then
+        read -p "Local Port (e.g. 8080): " LPORT
+        read -p "Kharej IP/Domain: " RHOST
+        read -p "Kharej Port: " RPORT
+        read -p "Enable HTTP Obfuscation? (y/n): " OBFUSCATE
 
-    meta=$(cat <<JSON
-{"name":"$NAME","role":"client","local_port":"$LOCAL_PORT","remote_host":"$REMOTE_HOST","remote_port":"$REMOTE_PORT","header":$(if [[ "$WANT_HDR" =~ ^[Yy] ]]; then printf '%s' "\"$HDR_HOST $HDR_PATH\""; else printf 'null'; fi), "created":"$(date --iso-8601=seconds)"}
-JSON
-)
-    add_tunnel_meta "$meta"
-    log "Client tunnel '$NAME' created."
+        CMD="socat TCP-LISTEN:${LPORT},reuseaddr,fork,keepalive,keepidle=10,keepintvl=10,keepcnt=3 TCP:${RHOST}:${RPORT},keepalive,keepidle=10,keepintvl=10,keepcnt=3"
 
-    safe_read SHOW "Show live logs now? (Y/n): "
-    if [[ -z "$SHOW" || "$SHOW" =~ ^[Yy] ]]; then
-      log "Tailing log for $NAME — press Ctrl-C to stop."
-      # prefer tail -f on run log file
-      tail -n 200 -f "$LOG_DIR/$NAME.log" || true
-    fi
-
-  else
-    # server (Kharej)
-    safe_read LISTEN_PORT "Listen port on KHAREJ (outside) (e.g. 443): "
-    safe_read TARGET_HOST "Target host on outside server (e.g. 127.0.0.1): "
-    safe_read TARGET_PORT "Target port on outside server (e.g. 1080): "
-
-    read -r -d '' RUN <<'RUN_EOF' || true
-LISTEN_PORT='__LP__'
-TARGET_HOST='__TH__'
-TARGET_PORT='__TP__'
-exec socat TCP-LISTEN:${LISTEN_PORT},reuseaddr,fork TCP:${TARGET_HOST}:${TARGET_PORT}
-RUN_EOF
-    RUN="${RUN//__LP__/$LISTEN_PORT}"
-    RUN="${RUN//__TH__/$TARGET_HOST}"
-    RUN="${RUN//__TP__/$TARGET_PORT}"
-
-    RUNPATH=$(write_run_script "$NAME" "$RUN")
-    create_systemd_unit_and_start "$NAME" "$RUNPATH"
-
-    meta=$(cat <<JSON
-{"name":"$NAME","role":"server","listen_port":"$LISTEN_PORT","target_host":"$TARGET_HOST","target_port":"$TARGET_PORT","created":"$(date --iso-8601=seconds)"}
-JSON
-)
-    add_tunnel_meta "$meta"
-    log "Server tunnel '$NAME' created."
-
-    safe_read SHOW "Show live logs now? (Y/n): "
-    if [[ -z "$SHOW" || "$SHOW" =~ ^[Yy] ]]; then
-      log "Tailing log for $NAME — press Ctrl-C to stop."
-      tail -n 200 -f "$LOG_DIR/$NAME.log" || true
-    fi
-  fi
-}
-
-remove_tunnel_flow() {
-  clear
-  echo "=== Remove Tunnel ==="
-  list_tunnels_meta
-  safe_read NAME "Enter tunnel name to remove (or Enter to cancel): "
-  if [[ -z "$NAME" ]]; then echo "Cancelled."; return; fi
-  systemctl stop "exittunnel-${NAME}.service" 2>/dev/null || true
-  systemctl disable "exittunnel-${NAME}.service" 2>/dev/null || true
-  rm -f "/etc/systemd/system/exittunnel-${NAME}.service" "$SCRIPTS_DIR/run-${NAME}.sh"
-  systemctl daemon-reload || true
-  remove_tunnel_meta "$NAME"
-  log "Removed tunnel '$NAME'."
-  sleep 1
-}
-
-list_flow() {
-  clear
-  echo "=== Tunnels ==="
-  list_tunnels_meta
-  echo ""
-  safe_read _ "Press Enter to go back..."
-}
-
-restart_flow() {
-  clear
-  echo "=== Restart Tunnel ==="
-  list_tunnels_meta
-  safe_read NAME "Enter tunnel name to restart (or Enter to cancel): "
-  if [[ -z "$NAME" ]]; then echo "Cancelled."; return; fi
-  systemctl restart "exittunnel-${NAME}.service"
-  log "Restarted $NAME"
-  sleep 1
-}
-
-logs_flow() {
-  clear
-  echo "=== Logs ==="
-  list_tunnels_meta
-  safe_read NAME "Enter tunnel name to view logs (or Enter to cancel): "
-  if [[ -z "$NAME" ]]; then echo "Cancelled."; return; fi
-  runlog="$LOG_DIR/$NAME.log"
-  if [[ -f "$runlog" ]]; then
-    log "Showing file log: $runlog (Ctrl-C to stop)"
-    tail -n 200 -f "$runlog" || true
-  else
-    log "No file log found; showing journalctl for service (Ctrl-C to stop)"
-    journalctl -u "exittunnel-${NAME}.service" -n 200 -f || true
-  fi
-}
-
-# CLI helper installed to /usr/local/bin/qdtunnel
-install_cli() {
-  cat > "$QDT_BIN" <<'EOF'
-#!/usr/bin/env bash
-CONF="/etc/exittunnel/tunnels.json"
-case "${1:-}" in
-  create) sudo bash /opt/exittunnel/installer.sh manager create ;;
-  list) sudo bash /opt/exittunnel/installer.sh manager list ;;
-  remove) sudo bash /opt/exittunnel/installer.sh manager remove ;;
-  restart) sudo bash /opt/exittunnel/installer.sh manager restart ;;
-  logs) sudo bash /opt/exittunnel/installer.sh manager logs ;;
-  help|"") echo "qdtunnel CLI: create|list|remove|restart|logs" ;;
-  *) echo "unknown" ;;
-esac
+        if [[ "$OBFUSCATE" =~ ^[Yy]$ ]]; then
+            read -p "Fake Host Header (e.g. update.microsoft.com): " FAKE_HOST
+            # Advanced Socat wrapper for HTTP injection
+            # Note: This is a basic injection. For full obfuscation, use Gost/V2Ray.
+            # We create a small script for the wrapper
+            WRAPPER_SCRIPT="$CONF_DIR/${TNAME}_wrapper.sh"
+            cat > "$WRAPPER_SCRIPT" <<EOF
+#!/bin/bash
+# Inject HTTP Header then connect
+(echo -ne "GET / HTTP/1.1\r\nHost: ${FAKE_HOST}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"; cat) | socat - TCP:${RHOST}:${RPORT}
 EOF
-  chmod +x "$QDT_BIN"
-  log "Installed CLI helper at $QDT_BIN"
-}
+            chmod +x "$WRAPPER_SCRIPT"
+            CMD="socat TCP-LISTEN:${LPORT},reuseaddr,fork SYSTEM:\"$WRAPPER_SCRIPT\""
+        fi
 
-# create manager wrapper
-install_manager_wrapper() {
-  cat > "$BASE_DIR/manager.sh" <<'MAN'
-#!/usr/bin/env bash
-if [[ ! -f /opt/exittunnel/installer.sh ]]; then
-  echo "installer missing"
-  exit 1
-fi
-exec bash /opt/exittunnel/installer.sh manager "$@"
-MAN
-  chmod +x "$BASE_DIR/manager.sh"
-}
+        create_service "$TNAME" "$CMD"
+        save_tunnel "{\"name\": \"$TNAME\", \"type\": \"iran\", \"lport\": \"$LPORT\", \"rhost\": \"$RHOST\", \"rport\": \"$RPORT\"}"
+        echo -e "${GREEN}[✓] Tunnel '$TNAME' Created!${NC}"
 
-# safe persist of installer to /opt/exittunnel/installer.sh
-persist_installer_self() {
-  SCRIPT_PATH="/opt/exittunnel/installer.sh"
-  if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
-    SRC_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
-    cp -f "$SRC_PATH" "$SCRIPT_PATH"
-    chmod +x "$SCRIPT_PATH"
-    log "Installer copied from $SRC_PATH to $SCRIPT_PATH"
-  else
-    # try to read remaining stdin safely (only if executed via pipe)
-    if [[ -r "/proc/$$/fd/0" ]]; then
-      TMP_SRC="$(mktemp /tmp/exittunnel_installer.XXXXXX.sh)"
-      # copy stdin to temp
-      cat /proc/$$/fd/0 > "$TMP_SRC" || true
-      if [[ -s "$TMP_SRC" ]]; then
-        cp -f "$TMP_SRC" "$SCRIPT_PATH"
-        chmod +x "$SCRIPT_PATH"
-        log "Installer written from stdin to $SCRIPT_PATH (temp $TMP_SRC)"
-      else
-        log "ERROR: Could not persist installer: no BASH_SOURCE and stdin empty"
-        # not fatal; continue (manager will not work if persisted copy missing)
-      fi
-    else
-      log "ERROR: Cannot determine script path and no stdin available."
+    elif [[ "$ROLE" == "2" ]]; then
+        read -p "Listen Port (Public): " LPORT
+        read -p "Target IP (usually 127.0.0.1): " RHOST
+        read -p "Target Port: " RPORT
+        
+        CMD="socat TCP-LISTEN:${LPORT},reuseaddr,fork,keepalive TCP:${RHOST}:${RPORT},keepalive"
+        create_service "$TNAME" "$CMD"
+        save_tunnel "{\"name\": \"$TNAME\", \"type\": \"kharej\", \"lport\": \"$LPORT\", \"rhost\": \"$RHOST\", \"rport\": \"$RPORT\"}"
+        echo -e "${GREEN}[✓] Tunnel '$TNAME' Created!${NC}"
     fi
-  fi
+    sleep 2
 }
 
-# manager command dispatcher (used by qdtunnel CLI)
-if [[ "${1:-}" == "manager" ]]; then
-  cmd="${2:-}"
-  case "$cmd" in
-    create) add_tunnel_flow ;;
-    list) list_flow ;;
-    remove) remove_tunnel_flow ;;
-    restart) restart_flow ;;
-    logs) logs_flow ;;
-    *) echo "manager commands: create|list|remove|restart|logs" ;;
-  esac
-  exit 0
-fi
+list_tunnels() {
+    clear
+    echo -e "${CYAN}=== Active Tunnels ===${NC}"
+    printf "%-15s %-10s %-10s %-25s\n" "NAME" "TYPE" "LOCAL" "REMOTE"
+    echo "------------------------------------------------------------"
+    jq -r '.[] | "\(.name) \(.type) \(.lport) \(.rhost):\(.rport)"' "$TUNNELS_JSON" | while read -r name type lport remote; do
+        printf "%-15s %-10s %-10s %-25s\n" "$name" "$type" "$lport" "$remote"
+    done
+    echo ""
+    read -p "Press Enter to return..."
+}
 
-# ---------- main ----------
+remove_tunnel() {
+    clear
+    echo -e "${CYAN}=== Remove Tunnel ===${NC}"
+    jq -r '.[] | .name' "$TUNNELS_JSON"
+    echo ""
+    read -p "Type tunnel name to remove: " TNAME
+    
+    if [[ -z "$TNAME" ]]; then return; fi
 
-require_root
-install_deps
-init_store
-install_cli
-install_manager_wrapper
-persist_installer_self
+    echo -e "${YELLOW}[*] Stopping service...${NC}"
+    systemctl stop "qdtunnel-${TNAME}"
+    systemctl disable "qdtunnel-${TNAME}"
+    rm "/etc/systemd/system/qdtunnel-${TNAME}.service"
+    systemctl daemon-reload
+    
+    # Remove wrapper if exists
+    if [[ -f "$CONF_DIR/${TNAME}_wrapper.sh" ]]; then
+        rm "$CONF_DIR/${TNAME}_wrapper.sh"
+    fi
 
-# interactive menu
+    remove_tunnel_db "$TNAME"
+    echo -e "${GREEN}[✓] Tunnel removed.${NC}"
+    sleep 1
+}
+
+show_logs() {
+    clear
+    echo -e "${CYAN}=== Tunnel Logs ===${NC}"
+    jq -r '.[] | .name' "$TUNNELS_JSON"
+    echo ""
+    read -p "Type tunnel name to see logs: " TNAME
+    if [[ -z "$TNAME" ]]; then return; fi
+    
+    echo -e "${BLUE}Press CTRL+C to exit logs${NC}"
+    journalctl -u "qdtunnel-${TNAME}" -f -n 50
+}
+
+# --- Main Logic ---
+
+install_self
+check_dependencies
+optimize_network
+init_db
+
 while true; do
-  clear
-  echo "===================================="
-  echo "   ExitTunnel — Iran ↔ Kharej (TCP)"
-  echo "===================================="
-  echo "1) Add Tunnel"
-  echo "2) Remove Tunnel"
-  echo "3) List Tunnels"
-  echo "4) Restart Tunnel"
-  echo "5) Logs"
-  echo "6) Exit"
-  echo "------------------------------------"
-  echo "Press Enter to refresh list."
-  echo ""
-  list_tunnels_meta
-  printf "\n"
-  safe_read CH "Choose [1-6] (or Enter): "
-  if [[ -z "$CH" ]]; then
-    continue
-  fi
-  case "$CH" in
-    1) add_tunnel_flow ;;
-    2) remove_tunnel_flow ;;
-    3) list_flow ;;
-    4) restart_flow ;;
-    5) logs_flow ;;
-    6) echo "Goodbye."; exit 0 ;;
-    *) echo "Invalid"; sleep 1 ;;
-  esac
+    clear
+    echo -e "${GREEN}  ___  ____  _____                          _ ${NC}"
+    echo -e "${GREEN} / _ \|  _ \|_   _|   _ _ __  _ __   ___| |${NC}"
+    echo -e "${GREEN}| | | | | | | | || | | | '_ \| '_ \ / _ \ |${NC}"
+    echo -e "${GREEN}| |_| | |_| | | || |_| | | | | | | |  __/ |${NC}"
+    echo -e "${GREEN} \__\_\____/  |_| \__,_|_| |_|_| |_|\___|_|${NC}"
+    echo -e "${CYAN}           Advanced Tunnel Manager v2.0     ${NC}"
+    echo "-----------------------------------------------"
+    echo "1. Add Tunnel"
+    echo "2. List Tunnels"
+    echo "3. Remove Tunnel"
+    echo "4. Show Logs"
+    echo "5. Restart All Services"
+    echo "0. Exit"
+    echo "-----------------------------------------------"
+    read -p "Select Option: " OPT
+
+    case $OPT in
+        1) add_tunnel ;;
+        2) list_tunnels ;;
+        3) remove_tunnel ;;
+        4) show_logs ;;
+        5) 
+           echo "Restarting services..."
+           systemctl daemon-reload
+           jq -r '.[] | .name' "$TUNNELS_JSON" | xargs -I {} systemctl restart "qdtunnel-{}"
+           sleep 1
+           ;;
+        0) echo "Bye!"; exit 0 ;;
+        *) echo "Invalid option"; sleep 1 ;;
+    esac
 done
