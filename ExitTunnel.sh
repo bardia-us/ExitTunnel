@@ -335,8 +335,35 @@ chmod +x "$BASE_DIR/manager.sh"
 
 # copy this running script into /opt/exittunnel/installer.sh so manager can re-use functions
 SCRIPT_PATH="/opt/exittunnel/installer.sh"
-awk 'NR==1{print "#!/usr/bin/env bash"} {print}' "$0" > "$SCRIPT_PATH"
-chmod +x "$SCRIPT_PATH"
+
+# ---------- SAFE SELF-COPY BLOCK (replaces fragile "$0" copy) ----------
+# Try to copy from BASH_SOURCE if script was executed from a file.
+# If running via a pipe (curl | bash), attempt to read remaining stdin via /proc/$$/fd/0
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+  SRC_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+  cp -f "$SRC_PATH" "$SCRIPT_PATH"
+  chmod +x "$SCRIPT_PATH"
+  echo "[info] installer copied from $SRC_PATH to $SCRIPT_PATH"
+else
+  # fallback: try to read stdin from /proc
+  if [[ -r "/proc/$$/fd/0" ]]; then
+    TMP_SRC="$(mktemp /tmp/exittunnel_installer.XXXXXX.sh)"
+    # copy whatever remains on stdin (if any) into temp file
+    cat /proc/$$/fd/0 > "$TMP_SRC" || true
+    if [[ -s "$TMP_SRC" ]]; then
+      cp -f "$TMP_SRC" "$SCRIPT_PATH"
+      chmod +x "$SCRIPT_PATH"
+      echo "[info] installer written from stdin to $SCRIPT_PATH (temp $TMP_SRC)"
+    else
+      echo "[error] Could not persist installer: no BASH_SOURCE and stdin empty" >&2
+      exit 1
+    fi
+  else
+    echo "[error] Cannot determine script path and no stdin available. Aborting." >&2
+    exit 1
+  fi
+fi
+# -----------------------------------------------------------------------
 
 # if installer invoked with 'manager' arg, run only manager CLI
 if [[ "${1:-}" == "manager" ]]; then
