@@ -1,114 +1,128 @@
 #!/bin/bash
 
 # ==========================================
-# QDTunnel STABLE - Debug Mode
+# QDTunnel v3.0 - English Edition
+# Stable & Simple TCP Forwarder
 # ==========================================
 
+# Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 CYAN='\033[0;36m'
+YELLOW='\033[1;33m'
 NC='\033[0m'
 
 CONF_DIR="/etc/qdtunnel"
 TUNNELS_JSON="$CONF_DIR/tunnels.json"
+SERVICE_DIR="/etc/systemd/system"
 
-# 1. چک کردن روت
+# --- 1. System Checks ---
 if [[ $EUID -ne 0 ]]; then
-   echo -e "${RED}[!] لطفا با دستور sudo اجرا کنید.${NC}"
+   echo -e "${RED}[!] Please run as root (sudo).${NC}"
    exit 1
 fi
 
-# 2. نصب پیش‌نیازها (اجباری)
-echo -e "${CYAN}[*] در حال بررسی پیش‌نیازها...${NC}"
-if ! command -v socat &> /dev/null; then
-    echo "Installing socat..."
-    apt-get update -qq && apt-get install -y socat -qq
-fi
-if ! command -v jq &> /dev/null; then
-    echo "Installing jq..."
-    apt-get install -y jq -qq
-fi
+# Install dependencies quietly
+echo -e "${CYAN}[*] Checking dependencies...${NC}"
+if ! command -v socat &> /dev/null; then apt-get update -qq && apt-get install -y socat -qq; fi
+if ! command -v jq &> /dev/null; then apt-get install -y jq -qq; fi
 
-# ساخت پوشه کانفیگ
 mkdir -p "$CONF_DIR"
-if [[ ! -f "$TUNNELS_JSON" ]]; then
-    echo "[]" > "$TUNNELS_JSON"
-fi
+if [[ ! -f "$TUNNELS_JSON" ]]; then echo "[]" > "$TUNNELS_JSON"; fi
 
-# --- توابع اصلی ---
+# --- 2. Helper Functions ---
+
+open_firewall() {
+    local PORT=$1
+    if command -v ufw &> /dev/null; then
+        if ufw status | grep -q "Status: active"; then
+            echo -e "${YELLOW}[*] Opening port $PORT in UFW...${NC}"
+            ufw allow "$PORT"/tcp > /dev/null
+        fi
+    fi
+    # Also try iptables just in case
+    iptables -I INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null
+}
+
+save_tunnel() {
+    # Safely append to JSON
+    jq ". += [$1]" "$TUNNELS_JSON" > "$TUNNELS_JSON.tmp" && mv "$TUNNELS_JSON.tmp" "$TUNNELS_JSON"
+}
+
+remove_tunnel_db() {
+    jq "map(select(.name != \"$1\"))" "$TUNNELS_JSON" > "$TUNNELS_JSON.tmp" && mv "$TUNNELS_JSON.tmp" "$TUNNELS_JSON"
+}
+
+# --- 3. Core Logic ---
 
 add_tunnel() {
-    echo -e "\n${CYAN}=== ساخت تانل جدید ===${NC}"
-    echo "این اسکریپت روی کدام سرور اجرا شده است؟"
-    echo "1) سرور ایران (مبدا)"
-    echo "2) سرور خارج (مقصد)"
-    read -r -p "انتخاب کنید [1-2]: " ROLE
+    clear
+    echo -e "${CYAN}=== Create New Tunnel ===${NC}"
+    echo "Which server is this?"
+    echo "1) IRAN Server (Bridge/Client)"
+    echo "2) KHAREJ Server (Destination/Upstream)"
+    read -p "Select [1-2]: " ROLE
 
-    if [[ "$ROLE" != "1" && "$ROLE" != "2" ]]; then
-        echo -e "${RED}گزینه اشتباه است!${NC}"
-        return
-    fi
+    read -p "Enter Tunnel Name (e.g., mytunnel): " TNAME
+    if [[ -z "$TNAME" ]]; then echo -e "${RED}Name is required!${NC}"; sleep 1; return; fi
 
-    read -r -p "یک نام انگلیسی برای تانل انتخاب کنید (مثلا radin): " TNAME
-    if [[ -z "$TNAME" ]]; then echo -e "${RED}نام نمی‌تواند خالی باشد.${NC}"; return; fi
-
-    # بررسی تکراری بودن نام
+    # Check for duplicates
     if grep -q "\"name\": \"$TNAME\"" "$TUNNELS_JSON"; then
-        echo -e "${RED}این نام قبلا استفاده شده!${NC}"; return;
+        echo -e "${RED}Name already exists!${NC}"; sleep 2; return;
     fi
 
     if [[ "$ROLE" == "1" ]]; then
-        # --- تنظیمات ایران ---
-        echo -e "\n${GREEN}--- تنظیمات سرور ایران ---${NC}"
-        read -r -p "پورت لوکال (پورتی که در ایران باز شود، مثلا 8080): " LPORT
-        read -r -p "آی‌پی سرور خارج (مثلا 85.x.x.x): " RHOST
-        read -r -p "پورت سرور خارج (پورتی که در خارج باز است): " RPORT
+        # --- IRAN CONFIG ---
+        echo -e "\n${GREEN}--- IRAN CONFIGURATION ---${NC}"
+        read -p "Local Port to open (e.g., 8080): " LPORT
+        read -p "Kharej Server IP: " RHOST
+        read -p "Kharej Server Port: " RPORT
         
-        # دستور اجرای تانل
-        CMD="socat TCP-LISTEN:${LPORT},reuseaddr,fork,keepalive TCP:${RHOST}:${RPORT},keepalive"
+        # Optimize tcp keepalive to prevent timeouts
+        CMD="socat TCP-LISTEN:${LPORT},reuseaddr,fork,keepalive,keepidle=10,keepintvl=10,keepcnt=3 TCP:${RHOST}:${RPORT},keepalive"
         
-        # ساخت سرویس
+        # Save & Run
+        open_firewall "$LPORT"
         create_service "$TNAME" "$CMD"
+        save_tunnel "{\"name\": \"$TNAME\", \"role\": \"IRAN\", \"listen\": \"$LPORT\", \"target\": \"$RHOST:$RPORT\"}"
         
-        # ذخیره در جیسون
-        JSON_STR="{\"name\": \"$TNAME\", \"type\": \"IRAN\", \"port\": \"$LPORT -> $RHOST:$RPORT\"}"
-        save_to_json "$JSON_STR"
-        
-        echo -e "${GREEN}[✓] تمام! تانل ایران روی پورت $LPORT فعال شد و به $RHOST متصل می‌شود.${NC}"
+        echo -e "${GREEN}[OK] Tunnel started! Connect your apps to THIS_SERVER_IP:$LPORT${NC}"
 
     elif [[ "$ROLE" == "2" ]]; then
-        # --- تنظیمات خارج ---
-        echo -e "\n${GREEN}--- تنظیمات سرور خارج ---${NC}"
-        read -r -p "پورت ورودی (پورتی که ایران به آن وصل می‌شود، مثلا 443): " LPORT
-        read -r -p "مقصد نهایی (معمولا 127.0.0.1): " RHOST
-        read -r -p "پورت مقصد نهایی (مثلا پورت کانفیگ V2ray): " RPORT
-
-        CMD="socat TCP-LISTEN:${LPORT},reuseaddr,fork,keepalive TCP:${RHOST}:${RPORT},keepalive"
+        # --- KHAREJ CONFIG ---
+        echo -e "\n${GREEN}--- KHAREJ CONFIGURATION ---${NC}"
+        read -p "Port to Listen on (Must match Iran's destination port): " LPORT
+        read -p "Final Destination IP (usually 127.0.0.1): " RHOST
+        read -p "Final Destination Port (e.g., your V2ray port): " RPORT
         
+        CMD="socat TCP-LISTEN:${LPORT},reuseaddr,fork,keepalive,keepidle=10,keepintvl=10,keepcnt=3 TCP:${RHOST}:${RPORT},keepalive"
+        
+        open_firewall "$LPORT"
         create_service "$TNAME" "$CMD"
+        save_tunnel "{\"name\": \"$TNAME\", \"role\": \"KHAREJ\", \"listen\": \"$LPORT\", \"target\": \"$RHOST:$RPORT\"}"
         
-        JSON_STR="{\"name\": \"$TNAME\", \"type\": \"KHAREJ\", \"port\": \"$LPORT -> $RHOST:$RPORT\"}"
-        save_to_json "$JSON_STR"
-        
-        echo -e "${GREEN}[✓] تمام! سرور خارج روی پورت $LPORT گوش می‌دهد و به $RPORT فوروارد می‌کند.${NC}"
+        echo -e "${GREEN}[OK] Server is ready to receive connections on port $LPORT${NC}"
+    else
+        echo "Invalid selection."
     fi
+    read -p "Press Enter..."
 }
 
 create_service() {
     local NAME=$1
-    local EXEC_CMD=$2
-    local SERVICE_PATH="/etc/systemd/system/qdtunnel-${NAME}.service"
+    local CMD=$2
+    local SFILE="$SERVICE_DIR/qdtunnel-${NAME}.service"
 
-    cat > "$SERVICE_PATH" <<EOF
+    cat > "$SFILE" <<EOF
 [Unit]
-Description=QDTunnel Service - ${NAME}
+Description=QDTunnel-$NAME
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/env bash -c '${EXEC_CMD}'
+ExecStart=/usr/bin/env bash -c '$CMD'
 Restart=always
 RestartSec=3
-User=root
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
@@ -118,58 +132,78 @@ EOF
     systemctl enable --now "qdtunnel-${NAME}"
 }
 
-save_to_json() {
-    # استفاده از فایل موقت برای جلوگیری از خرابی فایل اصلی
-    jq ". += [$1]" "$TUNNELS_JSON" > "$TUNNELS_JSON.tmp" && mv "$TUNNELS_JSON.tmp" "$TUNNELS_JSON"
-}
-
 list_tunnels() {
-    echo -e "\n${CYAN}=== لیست تانل‌های فعال ===${NC}"
+    clear
+    echo -e "${CYAN}=== Active Tunnels ===${NC}"
     if [[ ! -s "$TUNNELS_JSON" || "$(cat $TUNNELS_JSON)" == "[]" ]]; then
-        echo "هیچ تانلی وجود ندارد."
+        echo "No tunnels found."
     else
-        jq -r '.[] | "نام: \(.name) | مدل: \(.type) | مسیر: \(.port)"' "$TUNNELS_JSON"
+        printf "%-15s %-10s %-10s %-25s\n" "NAME" "ROLE" "PORT" "TARGET"
+        echo "-----------------------------------------------------------"
+        jq -r '.[] | "\(.name) \(.role) \(.listen) \(.target)"' "$TUNNELS_JSON" | while read -r name role listen target; do
+            printf "%-15s %-10s %-10s %-25s\n" "$name" "$role" "$listen" "$target"
+        done
     fi
     echo ""
+    read -p "Press Enter..."
+}
+
+check_status() {
+    clear
+    echo -e "${CYAN}=== System Status ===${NC}"
+    echo -e "${YELLOW}1. Checking Services:${NC}"
+    jq -r '.[] | .name' "$TUNNELS_JSON" | while read -r name; do
+        STATUS=$(systemctl is-active "qdtunnel-$name")
+        if [[ "$STATUS" == "active" ]]; then
+            echo -e "  $name: ${GREEN}RUNNING${NC}"
+        else
+            echo -e "  $name: ${RED}STOPPED/ERROR${NC}"
+        fi
+    done
+    echo ""
+    echo -e "${YELLOW}2. Checking Ports (Listening):${NC}"
+    netstat -tuln | grep -E "(socat|python)" || echo "  No active listeners found."
+    echo ""
+    read -p "Press Enter..."
 }
 
 remove_tunnel() {
-    echo -e "\n${CYAN}=== حذف تانل ===${NC}"
+    clear
+    echo -e "${CYAN}=== Remove Tunnel ===${NC}"
     jq -r '.[] | .name' "$TUNNELS_JSON"
     echo ""
-    read -r -p "نام تانل را برای حذف بنویسید: " TNAME
+    read -p "Enter tunnel name to DELETE: " TNAME
     
     if [[ -z "$TNAME" ]]; then return; fi
     
-    # حذف سرویس
     systemctl stop "qdtunnel-${TNAME}" 2>/dev/null
     systemctl disable "qdtunnel-${TNAME}" 2>/dev/null
-    rm "/etc/systemd/system/qdtunnel-${TNAME}.service" 2>/dev/null
+    rm "$SERVICE_DIR/qdtunnel-${TNAME}.service" 2>/dev/null
     systemctl daemon-reload
-
-    # حذف از دیتابیس
-    jq "map(select(.name != \"$TNAME\"))" "$TUNNELS_JSON" > "$TUNNELS_JSON.tmp" && mv "$TUNNELS_JSON.tmp" "$TUNNELS_JSON"
     
-    echo -e "${GREEN}[✓] تانل $TNAME حذف شد.${NC}"
+    remove_tunnel_db "$TNAME"
+    echo -e "${GREEN}[✓] Tunnel $TNAME deleted.${NC}"
+    sleep 1
 }
 
-# --- منوی اصلی ---
+# --- Main Menu ---
 while true; do
-    echo -e "\n=============================="
-    echo -e "   QDTunnel Manager (Fixed)"
-    echo -e "=============================="
-    echo "1. ساخت تانل جدید (Add)"
-    echo "2. نمایش لیست تانل‌ها (List)"
-    echo "3. حذف تانل (Delete)"
-    echo "0. خروج (Exit)"
-    echo "------------------------------"
-    read -r -p "انتخاب کنید: " OPT
+    clear
+    echo -e "${GREEN}QDTunnel Manager (English)${NC}"
+    echo "1. Add Tunnel"
+    echo "2. List Tunnels"
+    echo "3. Check Status / Diagnose"
+    echo "4. Remove Tunnel"
+    echo "0. Exit"
+    echo "--------------------------"
+    read -p "Choose: " OPT
 
     case $OPT in
         1) add_tunnel ;;
         2) list_tunnels ;;
-        3) remove_tunnel ;;
-        0) echo "خداحافظ"; exit 0 ;;
-        *) echo "گزینه اشتباه است." ;;
+        3) check_status ;;
+        4) remove_tunnel ;;
+        0) exit 0 ;;
+        *) ;;
     esac
 done
