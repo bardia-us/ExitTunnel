@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ====================================================
-#  QUIC-GOST TUNNEL - NEXT GEN 🚀
-#  Simple, Fast, Encrypted Tunnel using GOST v2
+#  GEMINI TUNNEL (Based on GOST V3)
+#  Modes: WebSocket (Reliable) | gRPC (Fast)
 # ====================================================
 
 # --- Colors ---
@@ -20,143 +20,164 @@ SERVICE_DIR="/etc/systemd/system"
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        echo -e "${RED}Please run as root!${NC}"
+        echo -e "${RED}[!] Please run as root.${NC}"
         exit 1
     fi
 }
 
-install_gost() {
+install_gost_v3() {
     if command -v gost &> /dev/null; then
-        echo -e "${GREEN}GOST is already installed.${NC}"
-        return
+        # Check version
+        VER=$(gost -V 2>&1)
+        if [[ "$VER" == *"gost 3"* ]]; then
+            echo -e "${GREEN}[✓] GOST V3 is already installed.${NC}"
+            return
+        fi
     fi
 
-    echo -e "${BLUE}[*] Detecting Architecture...${NC}"
-    ARCH=$(uname -m)
-    if [[ "$ARCH" == "x86_64" ]]; then
-        URL="https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-amd64-2.11.5.gz"
-    elif [[ "$ARCH" == "aarch64" ]]; then
-        URL="https://github.com/ginuerzh/gost/releases/download/v2.11.5/gost-linux-arm64-2.11.5.gz"
+    echo -e "${BLUE}[*] Installing GOST V3...${NC}"
+    rm -f /usr/local/bin/gost
+    
+    ARCH=$(dpkg --print-architecture)
+    if [[ "$ARCH" == "amd64" ]]; then
+        URL="https://github.com/go-gost/gost/releases/download/v3.0.0/gost_3.0.0_linux_amd64.tar.gz"
+    elif [[ "$ARCH" == "arm64" ]]; then
+        URL="https://github.com/go-gost/gost/releases/download/v3.0.0/gost_3.0.0_linux_arm64.tar.gz"
     else
         echo -e "${RED}Architecture $ARCH not supported automatically.${NC}"
-        return
+        exit 1
     fi
 
-    echo -e "${YELLOW}[*] Downloading GOST (The Beast)...${NC}"
-    wget -q --show-progress "$URL" -O /tmp/gost.gz
-    gzip -d /tmp/gost.gz
+    wget -q --show-progress "$URL" -O /tmp/gost.tar.gz
+    tar -xzvf /tmp/gost.tar.gz -C /tmp/
     mv /tmp/gost /usr/local/bin/
     chmod +x /usr/local/bin/gost
-    echo -e "${GREEN}[✓] GOST Installed Successfully!${NC}"
+    rm /tmp/gost.tar.gz
+    echo -e "${GREEN}[✓] GOST V3 Installed!${NC}"
 }
 
 setup_kharej() {
-    echo -e "\n${YELLOW}--- KHAREJ SERVER SETUP (DESTINATION) ---${NC}"
-    echo "This server will receive traffic via QUIC and send it to your V2Ray/Config."
+    echo -e "\n${YELLOW}--- KHAREJ SETUP (DESTINATION) ---${NC}"
+    echo "1) WebSocket (Most Reliable - Use this if UDP failed)"
+    echo "2) gRPC (Faster but sometimes blocked)"
+    read -p "Select Protocol [1-2]: " PROTO
     
-    read -p "Enter Tunnel Port (UDP port to listen on, e.g., 443 or 8443): " TUN_PORT
-    read -p "Enter Target Port (Where is V2Ray listening? e.g., 2053): " TARGET_PORT
-    
-    # Validation
-    if [[ -z "$TUN_PORT" || -z "$TARGET_PORT" ]]; then echo "${RED}Invalid inputs!${NC}"; return; fi
+    read -p "Tunnel Port (Input from Iran, e.g. 8080): " TUN_PORT
+    read -p "Target IP (Where is Config? usually 127.0.0.1): " TARGET_IP
+    read -p "Target Port (Config Port, e.g. 2053): " TARGET_PORT
 
-    SERVICE_FILE="$SERVICE_DIR/gost-kharej.service"
-    
-    # Command: Listen on QUIC, Forward to Localhost TCP
-    CMD="$GOST_PATH -L=quic://:$TUN_PORT/127.0.0.1:$TARGET_PORT"
+    if [[ "$PROTO" == "1" ]]; then
+        # WebSocket Listener
+        # Pattern: -L ws://:8080?path=/tun&forward=tcp://127.0.0.1:2053
+        CMD="$GOST_PATH -L ws://:$TUN_PORT?path=/tun&forward=tcp://$TARGET_IP:$TARGET_PORT"
+        NAME="ws"
+    else
+        # gRPC Listener
+        CMD="$GOST_PATH -L grpc://:$TUN_PORT?forward=tcp://$TARGET_IP:$TARGET_PORT"
+        NAME="grpc"
+    fi
 
-    cat > "$SERVICE_FILE" <<EOF
-[Unit]
-Description=GOST QUIC Tunnel (Kharej)
-After=network.target
-
-[Service]
-ExecStart=$CMD
-Restart=always
-User=root
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    systemctl enable --now gost-kharej
-    echo -e "${GREEN}[✓] Kharej Tunnel Started on UDP Port $TUN_PORT${NC}"
-    echo -e "${CYAN}Make sure port $TUN_PORT (UDP) is open in firewall!${NC}"
+    create_service "kharej" "$CMD"
+    echo -e "${GREEN}[✓] Kharej ($NAME) listening on port $TUN_PORT${NC}"
+    echo -e "${RED}[IMPORTANT] Ensure port $TUN_PORT is open in Firewall!${NC}"
 }
 
 setup_iran() {
-    echo -e "\n${YELLOW}--- IRAN SERVER SETUP (BRIDGE) ---${NC}"
-    echo "This server will accept user connections and fly them to Kharej via QUIC."
+    echo -e "\n${YELLOW}--- IRAN SETUP (BRIDGE) ---${NC}"
+    echo "1) WebSocket (Must match Kharej)"
+    echo "2) gRPC (Must match Kharej)"
+    read -p "Select Protocol [1-2]: " PROTO
     
-    read -p "Enter Local Port (User connects here, e.g., 8080): " USER_PORT
-    read -p "Enter Kharej IP Address: " KHAREJ_IP
-    read -p "Enter Kharej Tunnel Port (The QUIC port, e.g., 443): " TUN_PORT
-    
-    # Validation
-    if [[ -z "$USER_PORT" || -z "$KHAREJ_IP" || -z "$TUN_PORT" ]]; then echo "${RED}Invalid inputs!${NC}"; return; fi
+    read -p "Local Port (User Connects here, e.g. 443): " USER_PORT
+    read -p "Kharej IP Address: " KHAREJ_IP
+    read -p "Kharej Tunnel Port (Port you set on Kharej): " TUN_PORT
 
-    SERVICE_FILE="$SERVICE_DIR/gost-iran.service"
-    
-    # Command: Listen TCP, Forward QUIC (Insecure to skip cert check)
-    CMD="$GOST_PATH -L=tcp://:$USER_PORT -F=quic://$KHAREJ_IP:$TUN_PORT?keepalive=true&noverify=true"
+    if [[ "$PROTO" == "1" ]]; then
+        # WebSocket Forwarder
+        # Pattern: -L tcp://:443 -F ws://KHAREJ:PORT?path=/tun
+        CMD="$GOST_PATH -L tcp://:$USER_PORT -F ws://$KHAREJ_IP:$TUN_PORT?path=/tun"
+    else
+        # gRPC Forwarder
+        CMD="$GOST_PATH -L tcp://:$USER_PORT -F grpc://$KHAREJ_IP:$TUN_PORT"
+    fi
 
-    cat > "$SERVICE_FILE" <<EOF
+    create_service "iran" "$CMD"
+    echo -e "${GREEN}[✓] Iran Bridge started on port $USER_PORT${NC}"
+}
+
+create_service() {
+    local TYPE=$1
+    local EXEC=$2
+    local SFILE="$SERVICE_DIR/gost-$TYPE.service"
+
+    cat > "$SFILE" <<EOF
 [Unit]
-Description=GOST QUIC Tunnel (Iran)
+Description=GOST V3 Tunnel ($TYPE)
 After=network.target
 
 [Service]
-ExecStart=$CMD
+ExecStart=$EXEC
 Restart=always
 User=root
 LimitNOFILE=1048576
+StandardOutput=append:/var/log/gost.log
+StandardError=append:/var/log/gost.log
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    systemctl enable --now gost-iran
-    echo -e "${GREEN}[✓] Iran Tunnel Started on Port $USER_PORT${NC}"
-    echo -e "${BLUE}Users should connect to THIS server IP on port $USER_PORT${NC}"
+    systemctl enable --now "gost-$TYPE"
+}
+
+check_status() {
+    echo -e "\n${BLUE}--- SERVICE STATUS ---${NC}"
+    if systemctl is-active --quiet gost-kharej; then
+        echo -e "KHAREJ Service: ${GREEN}RUNNING${NC}"
+        echo "Logs (Last 5 lines):"
+        tail -n 5 /var/log/gost.log
+    elif systemctl is-active --quiet gost-iran; then
+        echo -e "IRAN Service: ${GREEN}RUNNING${NC}"
+        echo "Logs (Last 5 lines):"
+        tail -n 5 /var/log/gost.log
+    else
+        echo -e "Service: ${RED}STOPPED${NC}"
+        echo "Check logs at /var/log/gost.log"
+    fi
+    echo ""
+    read -p "Press Enter..."
 }
 
 remove_tunnel() {
-    echo -e "${RED}[!] Stopping and Removing Services...${NC}"
-    systemctl stop gost-kharej 2>/dev/null
-    systemctl disable gost-kharej 2>/dev/null
+    systemctl stop gost-kharej gost-iran 2>/dev/null
+    systemctl disable gost-kharej gost-iran 2>/dev/null
     rm "$SERVICE_DIR/gost-kharej.service" 2>/dev/null
-    
-    systemctl stop gost-iran 2>/dev/null
-    systemctl disable gost-iran 2>/dev/null
     rm "$SERVICE_DIR/gost-iran.service" 2>/dev/null
-    
     systemctl daemon-reload
-    echo -e "${GREEN}[✓] Cleaned up.${NC}"
+    echo -e "${GREEN}[✓] Removed.${NC}"
+    sleep 1
 }
 
-# --- Main Menu ---
+# --- Main ---
 check_root
-install_gost
+install_gost_v3
 
 while true; do
     clear
-    echo -e "${CYAN}==============================${NC}"
-    echo -e "${CYAN}   QUIC TUNNEL MANAGER (GOST) ${NC}"
-    echo -e "${CYAN}==============================${NC}"
+    echo -e "${CYAN}=== GEMINI TUNNEL (GOST V3) ===${NC}"
     echo "1. Setup KHAREJ (Destination)"
     echo "2. Setup IRAN (Bridge)"
-    echo "3. Remove Tunnel"
+    echo "3. Check Logs & Status (DEBUG)"
+    echo "4. Remove Tunnel"
     echo "0. Exit"
-    echo "------------------------------"
+    echo "-------------------------------"
     read -p "Select: " OPT
-
     case $OPT in
         1) setup_kharej; read -p "Press Enter..." ;;
         2) setup_iran; read -p "Press Enter..." ;;
-        3) remove_tunnel; read -p "Press Enter..." ;;
+        3) check_status ;;
+        4) remove_tunnel ;;
         0) exit 0 ;;
         *) echo "Invalid" ;;
     esac
