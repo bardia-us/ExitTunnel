@@ -1,8 +1,26 @@
 #!/bin/bash
 
 # ==========================================
-# GoTunnel Enterprise - All-in-One Manager
+# GoTunnel Enterprise v3.0 - CLI Edition
 # ==========================================
+
+if [ "$EUID" -ne 0 ]; then
+  echo -e "\e[31m❌ Please run as root (sudo bash install.sh)\e[0m"
+  exit
+fi
+
+# ------------------------------------------
+# 0. مکانیزم نصب خودکار (تبدیل به دستور سیستم)
+# ------------------------------------------
+INSTALL_PATH="/usr/local/bin/gotunnel"
+
+if [[ "$(realpath "$0")" != "$INSTALL_PATH" ]]; then
+    echo -e "\e[33m[*] Installing 'gotunnel' as a global command...\e[0m"
+    cp "$0" "$INSTALL_PATH"
+    chmod +x "$INSTALL_PATH"
+    echo -e "\e[32m[+] Installation complete! You can now just type 'gotunnel' from anywhere.\e[0m"
+    sleep 2
+fi
 
 DIR="/opt/gotunnel"
 BIN="$DIR/gotunnel-core"
@@ -11,16 +29,15 @@ GO_FILE="$DIR/main.go"
 mkdir -p $DIR
 
 # ------------------------------------------
-# 1. نصب Go و کامپایل سورس کد (فقط بار اول)
+# 1. نصب وابستگی‌ها و کامپایل هسته
 # ------------------------------------------
 setup_core() {
     if [ ! -f "$BIN" ]; then
-        echo -e "\e[33m[*] Installing dependencies and compiling core...\e[0m"
+        echo -e "\e[33m[*] Checking dependencies and compiling core...\e[0m"
         if ! command -v go &> /dev/null; then
             apt-get update -y && apt-get install golang -y
         fi
 
-        # جاسازی کدهای Go به صورت مستقیم داخل اسکریپت
         cat << 'EOF' > $GO_FILE
 package main
 
@@ -40,15 +57,29 @@ var (
 	listenAddr = flag.String("listen", ":8279", "Listen address")
 	remoteAddr = flag.String("remote", "127.0.0.1:9277", "Remote address")
 	secret     = flag.String("secret", "SecretKey123", "Auth token")
-	poolSize   = flag.Int("pool", 20, "Pool size")
+	poolSize   = flag.Int("pool", 50, "Pre-established pool size")
+	maxConns   = flag.Int("maxconn", 1000, "Max concurrent connections")
+	timeout    = flag.Duration("timeout", 10*time.Second, "Dial timeout")
 
 	bufferPool = sync.Pool{New: func() interface{} { return make([]byte, 32*1024) }}
 	connPool   chan net.Conn
+	sem        chan struct{} 
 )
+
+func tuneTCP(conn net.Conn) {
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		tcpConn.SetNoDelay(true)
+		tcpConn.SetKeepAlive(true)
+		tcpConn.SetKeepAlivePeriod(30 * time.Second)
+	}
+}
 
 func main() {
 	flag.Parse()
-	log.Printf("Starting [%s] Mode | Listen: %s | Target: %s", strings.ToUpper(*mode), *listenAddr, *remoteAddr)
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+	
+	sem = make(chan struct{}, *maxConns)
+	log.Printf("Starting [%s] | Listen: %s | Target: %s", strings.ToUpper(*mode), *listenAddr, *remoteAddr)
 
 	listener, err := net.Listen("tcp", *listenAddr)
 	if err != nil {
@@ -66,26 +97,41 @@ func main() {
 		if err != nil {
 			continue
 		}
-		if tcpConn, ok := conn.(*net.TCPConn); ok {
-			tcpConn.SetNoDelay(true)
-			tcpConn.SetKeepAlive(true)
-		}
-		if *mode == "server" {
-			go handleServer(conn)
-		} else {
-			go handleBridge(conn)
+		tuneTCP(conn)
+		select {
+		case sem <- struct{}{}:
+			if *mode == "server" {
+				go func() { defer func() { <-sem }(); handleServer(conn) }()
+			} else {
+				go func() { defer func() { <-sem }(); handleBridge(conn) }()
+			}
+		default:
+			log.Printf("Connection dropped: Max limits")
+			conn.Close()
 		}
 	}
 }
 
+func dialRemote() (net.Conn, error) {
+	targetConn, err := net.DialTimeout("tcp", *remoteAddr, *timeout)
+	if err == nil {
+		tuneTCP(targetConn)
+		targetConn.Write([]byte(*secret + "\n"))
+	}
+	return targetConn, err
+}
+
 func handleServer(clientConn net.Conn) {
 	defer clientConn.Close()
+	clientConn.SetReadDeadline(time.Now().Add(5 * time.Second)) 
 	reader := bufio.NewReader(clientConn)
-	token, _ := reader.ReadString('\n')
-	if strings.TrimSpace(token) != *secret {
+	token, err := reader.ReadString('\n')
+	if err != nil || strings.TrimSpace(token) != *secret {
 		return
 	}
-	targetConn, err := net.DialTimeout("tcp", *remoteAddr, 5*time.Second)
+	clientConn.SetReadDeadline(time.Time{}) 
+
+	targetConn, err := dialRemote()
 	if err != nil {
 		return
 	}
@@ -95,23 +141,33 @@ func handleServer(clientConn net.Conn) {
 
 func maintainPool() {
 	for {
-		targetConn, err := net.DialTimeout("tcp", *remoteAddr, 5*time.Second)
-		if err == nil {
-			if tcpConn, ok := targetConn.(*net.TCPConn); ok {
-				tcpConn.SetNoDelay(true)
-				tcpConn.SetKeepAlive(true)
+		if len(connPool) < *poolSize {
+			targetConn, err := dialRemote()
+			if err == nil {
+				connPool <- targetConn
+			} else {
+				time.Sleep(2 * time.Second)
 			}
-			targetConn.Write([]byte(*secret + "\n"))
-			connPool <- targetConn
 		} else {
-			time.Sleep(2 * time.Second)
+			time.Sleep(500 * time.Millisecond)
 		}
 	}
 }
 
 func handleBridge(localConn net.Conn) {
 	defer localConn.Close()
-	remoteConn := <-connPool
+	var remoteConn net.Conn
+	var err error
+
+	select {
+	case remoteConn = <-connPool:
+	default:
+		log.Printf("Pool empty! Direct dial fallback...")
+		remoteConn, err = dialRemote()
+		if err != nil {
+			return
+		}
+	}
 	defer remoteConn.Close()
 	bridgeTraffic(localConn, remoteConn)
 }
@@ -133,30 +189,32 @@ func bridgeTraffic(conn1, conn2 net.Conn) {
 EOF
         cd $DIR
         go build -o $BIN $GO_FILE
-        echo -e "\e[32m[+] Core compiled successfully!\e[0m"
+        echo -e "\e[32m[+] Core compiled!\e[0m"
         sleep 1
     fi
 }
 
 # ------------------------------------------
-# 2. منوی اصلی
+# 2. منوی اصلی برنامه
 # ------------------------------------------
 show_menu() {
     clear
     echo -e "\e[36m=========================================\e[0m"
-    echo -e "\e[1m          GoTunnel Manager v1.0          \e[0m"
+    echo -e "\e[1m        GoTunnel Global Manager        \e[0m"
     echo -e "\e[36m=========================================\e[0m"
-    echo "1. 🟢 Create New Tunnel"
-    echo "2. 🔴 Delete Existing Tunnel"
-    echo "3. 📊 Monitor Active Tunnels"
-    echo "0. ❌ Exit"
+    echo " 1) 🟢 Create New Tunnel"
+    echo " 2) 🛠️  My Tunnels (Manage / Delete)"
+    echo " 3) 📊 Status (Monitor & Logs)"
+    echo " 4) 🗑️  Uninstall GoTunnel"
+    echo " 0) ❌ Exit"
     echo -e "\e[36m=========================================\e[0m"
     read -p "Select an option: " choice
 
     case $choice in
         1) create_tunnel ;;
-        2) delete_tunnel ;;
+        2) my_tunnels ;;
         3) monitor_tunnels ;;
+        4) uninstall_all ;;
         0) exit 0 ;;
         *) echo "Invalid option!"; sleep 1; show_menu ;;
     esac
@@ -167,23 +225,22 @@ show_menu() {
 # ------------------------------------------
 create_tunnel() {
     echo -e "\n\e[33m--- Create Tunnel ---\e[0m"
-    echo "1) Server Mode (Receives traffic from tunnel, forwards to local app)"
-    echo "2) Bridge Mode (Receives traffic from user, forwards to tunnel)"
-    read -p "Select Mode [1/2]: " mode_num
+    read -p "Select Mode (1=Server/Exit, 2=Bridge/Client): " mode_num
 
     if [ "$mode_num" == "1" ]; then
         MODE="server"
         read -p "Tunnel Listen Port (e.g., 8279): " LISTEN_PORT
         read -p "Forward to IP:Port (e.g., 127.0.0.1:9277): " TARGET_ADDR
-    elif [ "$mode_num" == "2" ]; then
+    else
         MODE="bridge"
         read -p "Local Listen Port (e.g., 9277): " LISTEN_PORT
         read -p "Remote Server IP:Port (e.g., 1.1.1.1:8279): " TARGET_ADDR
-    else
-        echo "Invalid Mode!"; sleep 1; show_menu
     fi
 
     read -p "Enter Secret Key (e.g., MySecret123): " SECRET_KEY
+    read -p "Max Concurrent Connections (Default: 1000): " MAX_CONN
+    MAX_CONN=${MAX_CONN:-1000}
+
     SVC_NAME="gotunnel-${MODE}-${LISTEN_PORT}"
     
     cat <<EOF > /etc/systemd/system/${SVC_NAME}.service
@@ -193,10 +250,10 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=$BIN -mode $MODE -listen :$LISTEN_PORT -remote $TARGET_ADDR -secret $SECRET_KEY
+ExecStart=$BIN -mode $MODE -listen :$LISTEN_PORT -remote $TARGET_ADDR -secret $SECRET_KEY -maxconn $MAX_CONN
 Restart=always
 RestartSec=3
-LimitNOFILE=65535
+LimitNOFILE=100000
 
 [Install]
 WantedBy=multi-user.target
@@ -204,16 +261,16 @@ EOF
 
     systemctl daemon-reload
     systemctl enable --now ${SVC_NAME}.service
-    echo -e "\e[32m[+] Tunnel $SVC_NAME created and started!\e[0m"
+    echo -e "\e[32m[+] Tunnel $SVC_NAME running successfully!\e[0m"
     read -p "Press Enter to return..."
     show_menu
 }
 
 # ------------------------------------------
-# 4. حذف تانل
+# 4. تانل‌های من (مشاهده و حذف)
 # ------------------------------------------
-delete_tunnel() {
-    echo -e "\n\e[33m--- Delete Tunnel ---\e[0m"
+my_tunnels() {
+    echo -e "\n\e[33m--- My Tunnels ---\e[0m"
     tunnels=($(ls /etc/systemd/system/gotunnel-*.service 2>/dev/null | awk -F'/' '{print $5}' | sed 's/.service//'))
     
     if [ ${#tunnels[@]} -eq 0 ]; then
@@ -222,59 +279,75 @@ delete_tunnel() {
         show_menu
     fi
 
+    echo "List of installed tunnels:"
     for i in "${!tunnels[@]}"; do
-        echo "$((i+1)). ${tunnels[$i]}"
+        echo "  $((i+1)). ${tunnels[$i]}"
     done
+    echo "-----------------------------------"
+    read -p "Enter tunnel number to DELETE (or 0 to go back): " del_idx
 
-    read -p "Select tunnel to delete (0 to cancel): " del_idx
     if [[ "$del_idx" -gt 0 && "$del_idx" -le "${#tunnels[@]}" ]]; then
         SVC_TO_DEL="${tunnels[$((del_idx-1))]}"
         systemctl stop $SVC_TO_DEL
         systemctl disable $SVC_TO_DEL
         rm -f /etc/systemd/system/${SVC_TO_DEL}.service
         systemctl daemon-reload
-        echo -e "\e[32m[+] Tunnel $SVC_TO_DEL deleted.\e[0m"
+        echo -e "\e[32m[-] Tunnel $SVC_TO_DEL deleted permanently.\e[0m"
     fi
-    read -p "Press Enter to return..."
-    show_menu
+    sleep 1; show_menu
 }
 
 # ------------------------------------------
-# 5. مانیتورینگ تانل‌ها
+# 5. وضعیت تانل‌ها و مانیتورینگ
 # ------------------------------------------
 monitor_tunnels() {
     echo -e "\n\e[33m--- Active Tunnels Status ---\e[0m"
     tunnels=($(ls /etc/systemd/system/gotunnel-*.service 2>/dev/null | awk -F'/' '{print $5}' | sed 's/.service//'))
     
-    printf "%-30s %-15s %-15s\n" "TUNNEL NAME" "STATUS" "CONNECTIONS"
-    echo "------------------------------------------------------------"
+    printf "%-25s %-12s %-12s\n" "TUNNEL" "STATUS" "CONNS"
+    echo "---------------------------------------------------"
     
     for tun in "${tunnels[@]}"; do
         STATUS=$(systemctl is-active $tun)
         PORT=$(echo $tun | awk -F'-' '{print $3}')
-        # شمارش تعداد کانکشن‌های فعال روی پورت تانل
         CONNS=$(ss -tn | grep ":$PORT " | wc -l)
         
         if [ "$STATUS" == "active" ]; then
-            printf "%-30s \e[32m%-15s\e[0m %-15s\n" "$tun" "Running" "$CONNS active"
+            printf "%-25s \e[32m%-12s\e[0m %-12s\n" "$tun" "Running" "$CONNS active"
         else
-            printf "%-30s \e[31m%-15s\e[0m %-15s\n" "$tun" "Stopped/Failed" "-"
+            printf "%-25s \e[31m%-12s\e[0m %-12s\n" "$tun" "Stopped" "-"
         fi
     done
     
-    echo -e "\n(Use 'journalctl -u <tunnel_name> -f' to see live logs)"
+    echo -e "\n\e[36m[TIP] To view live logs, run this outside the menu:\e[0m"
+    echo "journalctl -u gotunnel-<mode>-<port> -f"
     read -p "Press Enter to return..."
     show_menu
 }
 
-# ==========================================
-# اجرای اولیه
-# ==========================================
-if [ "$EUID" -ne 0 ]; then
-  echo -e "\e[31mPlease run as root (sudo ./gotunnel.sh)\e[0m"
-  exit
-fi
+# ------------------------------------------
+# 6. حذف کامل (Uninstall)
+# ------------------------------------------
+uninstall_all() {
+    echo -e "\n\e[31m⚠️  WARNING: This will delete ALL tunnels and the 'gotunnel' command.\e[0m"
+    read -p "Are you sure? (y/N): " confirm
+    if [[ "$confirm" == "y" || "$confirm" == "Y" ]]; then
+        echo "Stopping all services..."
+        rm -f /etc/systemd/system/gotunnel-*.service
+        systemctl daemon-reload
+        
+        echo "Removing core files and command..."
+        rm -rf /opt/gotunnel
+        rm -f /usr/local/bin/gotunnel
+        
+        echo -e "\e[32m[+] GoTunnel completely uninstalled! Bye 👋\e[0m"
+        exit 0
+    else
+        echo "Aborted."
+        sleep 1; show_menu
+    fi
+}
 
+# اجرای سیستم
 setup_core
 show_menu
-
